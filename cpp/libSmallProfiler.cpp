@@ -2,23 +2,58 @@
  * Based on the linAsyncGetCallTraceTest.cpp and libAsyncGetStackTraceSampler.cpp from the OpenJDK project.
  */
 
+#include <algorithm>
+#include <atomic>
 #include <assert.h>
+#include <chrono>
+#include <iostream>
 #include <dlfcn.h>
+#include <mutex>
+#include <optional>
 #include <signal.h>
 #include <stdio.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
-#include <atomic>
+#include <tuple>
+#include <thread>
+#include <random>
+#include <unordered_map>
+#include <vector>
 #include <sys/types.h>
 #include <sys/time.h>
+
+#include <pthread.h>
+
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include "jvmti.h"
-#include "profile.h"
 
 static jvmtiEnv* jvmti;
 static JNIEnv* env;
 
+void ensureSuccess(jvmtiError err, const char *msg) {
+  if (err != JVMTI_ERROR_NONE) {
+    fprintf(stderr, "Error in %s: %d", msg, err);
+    exit(1);
+  }
+}
+
+pid_t get_thread_id() {
+  #if defined(__APPLE__) && defined(__MACH__)
+  uint64_t tid;
+  pthread_threadid_np(NULL, &tid);
+  return (pid_t) tid;
+  #else
+  return syscall(SYS_gettid);
+  #endif
+}
+
 static size_t interval_ns = 1000000;  // 1ms
+static bool wall_clock_mode = true;
 
 size_t parseTimeToNanos(char *str) {
   char *suffix = str + strlen(str) - 2;
@@ -46,9 +81,84 @@ void parseOptions(char *options) {
     if (strncmp(token, "interval=", 9) == 0) {
       interval_ns = parseTimeToNanos(token + 9);
     }
+    if (strncmp(token, "cpu", 3) == 0) {
+      wall_clock_mode = false;
+    }
     token = strtok(NULL, ",");
   }
 }
+
+bool is_thread_running(jthread thread) {
+  jint state;
+  auto err = jvmti->GetThreadState(thread, &state);
+  return err == 0 && state != JVMTI_THREAD_STATE_RUNNABLE;
+}
+
+const int MAX_THREADS_PER_ITERATION = 8;
+
+struct ValidThreadInfo {
+    jthread jthread;
+    pthread_t pthread;
+    bool is_running;
+    long id;
+};
+class ThreadMap {
+  std::recursive_mutex m;
+  std::unordered_map<pid_t, ValidThreadInfo> map;
+  std::vector<std::string> names;
+
+  public:
+
+    void add(pid_t pid, std::string name, jthread thread) {
+      const std::lock_guard<std::recursive_mutex> lock(m);
+      map[pid] = ValidThreadInfo{.jthread = thread, .pthread = pthread_self(), .id = (long)names.size()};
+      names.emplace_back(name);
+    }
+
+    void remove(pid_t pid) {
+      const std::lock_guard<std::recursive_mutex> lock(m);
+      map.erase(pid);
+    }
+
+    std::optional<ValidThreadInfo> get_info(pid_t pid) {
+      const std::lock_guard<std::recursive_mutex> lock(m);
+      if (map.find(pid) == map.end()) {
+        return {};
+      }
+      return {map.at(pid)};
+    }
+
+    long get_id(pid_t pid) {
+      return get_info(pid).value().id;
+    }
+
+    const std::string& get_name(long id) {
+      const std::lock_guard<std::recursive_mutex> lock(m);
+      return names.at(id);
+    }
+
+    std::vector<pid_t> get_all_threads() {
+      const std::lock_guard<std::recursive_mutex> lock(m);
+      std::vector<pid_t> pids;
+      for (const auto &it : map) {
+        if (wall_clock_mode || is_thread_running(it.second.jthread)) {
+          pids.emplace_back(it.first);
+        }
+      }
+      return pids;
+    }
+
+    std::vector<pid_t> get_shuffled_threads() {
+      const std::lock_guard<std::recursive_mutex> lock(m);
+      std::vector<pid_t> threads = get_all_threads();
+      std::random_device rd;
+      std::mt19937 g(rd());
+      std::shuffle(threads.begin(), threads.end(), g);
+      return std::vector(threads.begin(), threads.begin() + std::min(MAX_THREADS_PER_ITERATION, (int)threads.size()));
+    }
+};
+
+static ThreadMap thread_map;
 
 typedef void (*SigAction)(int, siginfo_t*, void*);
 typedef void (*SigHandler)(int);
@@ -146,38 +256,109 @@ static void initASGCT() {
 std::atomic<size_t> failedTraces = 0;
 std::atomic<size_t> totalTraces = 0;
 
+int available_trace;
+int stored_traces;
+
+const int MAX_DEPTH = 512; // max number of frames to capture
+
+static ASGCT_CallFrame global_frames[MAX_DEPTH * MAX_THREADS_PER_ITERATION];
+static ASGCT_CallTrace global_traces[MAX_THREADS_PER_ITERATION];
+
 static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
-  const int MAX_DEPTH = 512; // max number of frames to capture
-  static ASGCT_CallFrame frames[MAX_DEPTH];
-  ASGCT_CallTrace trace;
-  trace.frames = frames;
-  trace.num_frames = 0;
-  trace.env_id = env;
-  asgct(&trace, MAX_DEPTH, ucontext);
-  totalTraces++;
-  if (trace.num_frames < 0) {
-    failedTraces++;
+  asgct(&global_traces[available_trace++], MAX_DEPTH, ucontext);
+  stored_traces++;
+}
+
+static void initSampler() {
+  for (int i = 0; i < MAX_THREADS_PER_ITERATION; i++) {
+    global_traces[i].frames = global_frames + i * MAX_DEPTH;
+    global_traces[i].num_frames = 0;
+    global_traces[i].env_id = env;
+  }
+  installSignalHandler(SIGPROF, signalHandler);
+}
+
+static void processTraces(size_t num_threads) {
+  for (int i = 0; i < num_threads; i++) {
+    auto& trace = global_traces[i];
+    if (trace.num_frames <= 0) {
+      failedTraces++;
+    }
+    totalTraces++;
   }
 }
 
-static bool startITimerSampler() {
-  time_t sec = interval_ns / 1000000000;
-  suseconds_t usec = (interval_ns % 1000000000) / 1000;
-  struct itimerval tv = {{sec, usec}, {sec, usec}};
+static void sampleThreads() {
+  available_trace = 0;
+  stored_traces = 0;
 
-  installSignalHandler(SIGPROF, signalHandler);
-
-  if (setitimer(ITIMER_PROF, &tv, NULL) != 0) {
-    return false;
+  auto threads = thread_map.get_shuffled_threads();
+  for (pid_t thread : threads) {
+    auto info = thread_map.get_info(thread);
+    if (info) {
+      pthread_kill(info->pthread, SIGPROF);
+    }
   }
-  return true;
+  while (stored_traces < threads.size());
+  processTraces(threads.size());
+}
+
+static void endSampler() {
+  printf("Failed traces: %10zu\n", failedTraces.load());
+  printf("Total traces:  %10zu\n", totalTraces.load());
+  printf("Failed ratio:  %10.2f%%\n", (double)failedTraces.load() / totalTraces.load() * 100);
+}
+
+std::atomic<bool> shouldStop = false;
+std::thread samplerThread;
+
+static void sampleLoop() {
+  initSampler();
+  std::chrono::nanoseconds interval{interval_ns};
+  while (!shouldStop) {
+    auto start = std::chrono::system_clock::now();
+    sampleThreads();
+    auto duration = std::chrono::system_clock::now() - start;
+   auto sleep = interval - duration;
+    if (std::chrono::seconds::zero() < sleep) {
+      std::this_thread::sleep_for(sleep);
+    }
+  }
+  endSampler();
+}
+
+static void startSamplerThread() {
+  samplerThread = std::thread(sampleLoop);
+}
+
+sigset_t prof_signal_mask;
+
+void JNICALL
+OnThreadStart(jvmtiEnv *jvmti_env,
+            JNIEnv* jni_env,
+            jthread thread) {
+  jvmtiThreadInfo info;           
+  ensureSuccess(jvmti->GetThreadInfo(thread, &info), "GetThreadInfo");
+  thread_map.add(get_thread_id(), info.name, thread);
+  pthread_sigmask(SIG_UNBLOCK, &prof_signal_mask, NULL);
+}
+
+void JNICALL
+OnThreadEnd(jvmtiEnv *jvmti_env,
+            JNIEnv* jni_env,
+            jthread thread) {
+  pthread_sigmask(SIG_BLOCK, &prof_signal_mask, NULL);
+  thread_map.remove(get_thread_id());
 }
 
 static void JNICALL OnVMInit(jvmtiEnv *jvmti, JNIEnv *jni_env, jthread thread) {
   jint class_count = 0;
   env = jni_env;
+  sigemptyset(&prof_signal_mask);
+  sigaddset(&prof_signal_mask, SIGPROF);
+  OnThreadStart(jvmti, jni_env, thread);
   // Get any previously loaded classes that won't have gone through the
-  // OnClassPrepare callback to prime the jmethods for AsyncGetStackTrace.
+  // OnClassPrepare callback to prime the jmethods for AsyncGetCallTrace.
   JvmtiDeallocator<jclass> classes;
   jvmtiError err = jvmti->GetLoadedClasses(&class_count, classes.addr());
   if (err != JVMTI_ERROR_NONE) {
@@ -190,10 +371,9 @@ static void JNICALL OnVMInit(jvmtiEnv *jvmti, JNIEnv *jni_env, jthread thread) {
   for (int i = 0; i < class_count; ++i) {
     GetJMethodIDs(classList[i]);
   }
-  
-  startITimerSampler();
-}
 
+  startSamplerThread();
+}
 
 extern "C" {
 
@@ -224,6 +404,8 @@ jint Agent_Initialize(JavaVM *jvm, char *options, void *reserved) {
   callbacks.ClassLoad = &OnClassLoad;
   callbacks.VMInit = &OnVMInit;
   callbacks.ClassPrepare = &OnClassPrepare;
+  callbacks.ThreadStart = &OnThreadStart;
+  callbacks.ThreadEnd = &OnThreadEnd;
 
   err = jvmti->SetEventCallbacks(&callbacks, sizeof(jvmtiEventCallbacks));
   if (err != JVMTI_ERROR_NONE) {
@@ -273,9 +455,8 @@ jint JNICALL JNI_OnLoad(JavaVM *jvm, void *reserved) {
 
 JNIEXPORT
 void JNICALL Agent_OnUnload(JavaVM *jvm) {
-  printf("Failed traces: %10zu\n", failedTraces.load());
-  printf("Total traces:  %10zu\n", totalTraces.load());
-  printf("Failed ratio:  %10.2f%%\n", (double)failedTraces.load() / totalTraces.load() * 100);
+  shouldStop = true;
+  samplerThread.join();
 }
 
 }
