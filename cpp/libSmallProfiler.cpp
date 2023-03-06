@@ -256,8 +256,8 @@ static void initASGCT() {
 std::atomic<size_t> failedTraces = 0;
 std::atomic<size_t> totalTraces = 0;
 
-int available_trace;
-int stored_traces;
+std::atomic<int> available_trace;
+std::atomic<int> stored_traces;
 
 const int MAX_DEPTH = 512; // max number of frames to capture
 
@@ -265,7 +265,11 @@ static ASGCT_CallFrame global_frames[MAX_DEPTH * MAX_THREADS_PER_ITERATION];
 static ASGCT_CallTrace global_traces[MAX_THREADS_PER_ITERATION];
 
 static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
-  asgct(&global_traces[available_trace++], MAX_DEPTH, ucontext);
+  int index = available_trace;
+  while (index < MAX_THREADS_PER_ITERATION &&
+         !available_trace.compare_exchange_weak(index, index + 1)) {
+  }
+  asgct(&global_traces[index], MAX_DEPTH, ucontext);
   stored_traces++;
 }
 
@@ -319,7 +323,7 @@ static void sampleLoop() {
     auto start = std::chrono::system_clock::now();
     sampleThreads();
     auto duration = std::chrono::system_clock::now() - start;
-   auto sleep = interval - duration;
+    auto sleep = interval - duration;
     if (std::chrono::seconds::zero() < sleep) {
       std::this_thread::sleep_for(sleep);
     }
