@@ -94,7 +94,7 @@ bool is_thread_running(jthread thread) {
   return err == 0 && state != JVMTI_THREAD_STATE_RUNNABLE;
 }
 
-const int MAX_THREADS_PER_ITERATION = 8;
+const int MAX_THREADS_PER_ITERATION = 1;
 
 struct ValidThreadInfo {
     jthread jthread;
@@ -256,8 +256,13 @@ static void initASGCT() {
 std::atomic<size_t> failedTraces = 0;
 std::atomic<size_t> totalTraces = 0;
 
-std::atomic<int> available_trace;
-std::atomic<int> stored_traces;
+std::atomic<size_t> brokenTraces;
+std::atomic<size_t> brokenBecauseOfGCTError;
+std::atomic<size_t> brokenBecauseOfLengthMismatch;
+std::atomic<size_t> brokenBecauseOfFrameMismatch;
+
+int available_trace;
+int stored_traces;
 
 const int MAX_DEPTH = 512; // max number of frames to capture
 
@@ -265,12 +270,70 @@ static ASGCT_CallFrame global_frames[MAX_DEPTH * MAX_THREADS_PER_ITERATION];
 static ASGCT_CallTrace global_traces[MAX_THREADS_PER_ITERATION];
 
 static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
-  int index = available_trace;
-  while (index < MAX_THREADS_PER_ITERATION &&
-         !available_trace.compare_exchange_weak(index, index + 1)) {
-  }
-  asgct(&global_traces[index], MAX_DEPTH, ucontext);
+  asgct(&global_traces[available_trace++], MAX_DEPTH, ucontext);
   stored_traces++;
+}
+
+static void printGCTError(jvmtiError err) {
+  switch (err) {
+    case JVMTI_ERROR_ILLEGAL_ARGUMENT:
+      fprintf(stderr, "start_depth is positive and greater than or equal to stackDepth. Or start_depth is negative and less than -stackDepth.\n");
+      break;
+    case JVMTI_ERROR_INVALID_THREAD:
+      fprintf(stderr, "thread is not a thread object. \n");
+      break;
+    case JVMTI_ERROR_THREAD_NOT_ALIVE:
+      fprintf(stderr, "thread is not alive (has not been started or has terminated).\n");
+      break;
+    case JVMTI_ERROR_NULL_POINTER:
+      fprintf(stderr, "stack_info_ptr is NULL.\n");
+      break;
+    case JVMTI_ERROR_WRONG_PHASE:
+      fprintf(stderr, "JVMTI is not in live phase.\n");
+      break;
+    case JVMTI_ERROR_UNATTACHED_THREAD:
+      fprintf(stderr, "thread is not attached to the VM.\n");
+      break;
+    default:
+      fprintf(stderr, "unknown error %d.\n", err);
+      break;
+  }
+}
+
+static void checkWithGCT(ASGCT_CallTrace asgctTrace, jthread thread) {
+  totalTraces++;
+  if (asgctTrace.num_frames <= 0) {
+    failedTraces++;
+    return;
+  }
+  jvmtiFrameInfo gstFrames[MAX_DEPTH];
+  jint gstCount = 0;
+  jvmtiError err = jvmti->GetStackTrace(thread, 0, MAX_DEPTH, gstFrames, &gstCount);
+  if (err != JVMTI_ERROR_NONE) {
+    brokenTraces++;
+    brokenBecauseOfGCTError++;
+    printGCTError(err);
+    return;
+  }
+  if (asgctTrace.num_frames != gstCount) {
+    brokenTraces++;
+    brokenBecauseOfLengthMismatch++;
+    return;
+  }
+  for (int i = 0; i < gstCount; i++) {
+    if (asgctTrace.frames[i].method_id != gstFrames[i].method) {
+      brokenTraces++;
+      brokenBecauseOfFrameMismatch++;
+      return;
+    }
+  }
+}
+
+
+static void handleThread(ValidThreadInfo info) {
+  assert(available_trace == 0);
+  pthread_kill(info.pthread, SIGPROF);
+  checkWithGCT(global_traces[0], info.jthread);
 }
 
 static void initSampler() {
@@ -282,41 +345,36 @@ static void initSampler() {
   installSignalHandler(SIGPROF, signalHandler);
 }
 
-static void processTraces(size_t num_threads) {
-  for (int i = 0; i < num_threads; i++) {
-    auto& trace = global_traces[i];
-    if (trace.num_frames <= 0) {
-      failedTraces++;
-    }
-    totalTraces++;
-  }
-}
-
 static void sampleThreads() {
   available_trace = 0;
   stored_traces = 0;
 
   auto threads = thread_map.get_shuffled_threads();
-  for (pid_t thread : threads) {
-    auto info = thread_map.get_info(thread);
-    if (info) {
-      pthread_kill(info->pthread, SIGPROF);
-    }
+  auto thread = threads[0];
+  auto info = thread_map.get_info(thread);
+  if (info) {
+    handleThread(*info);
   }
-  while (stored_traces < threads.size());
-  processTraces(threads.size());
+}
+
+static void printValue(const char* name, std::atomic<size_t> &value) {
+  printf("%-20s %10zu\n", name, value.load());
 }
 
 static void endSampler() {
-  printf("Failed traces: %10zu\n", failedTraces.load());
-  printf("Total traces:  %10zu\n", totalTraces.load());
-  printf("Failed ratio:  %10.2f%%\n", (double)failedTraces.load() / totalTraces.load() * 100);
+  printValue("Total", totalTraces);
+  printValue("Failed", failedTraces);
+  printValue("Broken", brokenTraces);
+  printValue("  GCT error", brokenBecauseOfGCTError);
+  printValue("  Length mismatch", brokenBecauseOfLengthMismatch);
+  printValue("  Frame mismatch", brokenBecauseOfFrameMismatch);
 }
 
 std::atomic<bool> shouldStop = false;
 std::thread samplerThread;
 
 static void sampleLoop() {
+  
   initSampler();
   std::chrono::nanoseconds interval{interval_ns};
   while (!shouldStop) {
