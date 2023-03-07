@@ -1,34 +1,36 @@
-Writing a Profiler from Scratch
-===============================
-
-This repository belongs to my article series with the same name. 
-It is a step-by-step guide to writing a profiler from scratch:
-
-- [Introduction](https://mostlynerdless.de/blog/2022/12/20/writing-a-profiler-from-scratch-introduction/)
-
-This repository currently looks a bit barren, it contains just the example Java code and
-the introductory agent code. More will come as the article series progresses.
-
-How to run this all?
---------------------
+This is a reproducer for a bug regarding GetStackTrace:
 
 ```sh
-# compile the Java sample code
-javac samples/BasicSample.java
 
-# compile the small profiler agent
-# on mac
-g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/darwin -I$JAVA_HOME/include -o libSmallProfiler.dylib -std=c++17 -shared -pthread 
-# on linux
-g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/linux -I$JAVA_HOME/include -o libSmallProfiler.so -std=c++17 -shared -pthread -fPIC
+test -e renaissance.jar || wget https://github.com/renaissance-benchmarks/renaissance/releases/download/v0.14.2/renaissance-gpl-0.14.2.jar -O renaissance.jar
 
-# run them together on mac
-java -agentpath:./libSmallProfiler.dylib=interval=0.001s -cp samples BasicSample
 # on linux
-java -agentpath:./libSmallProfiler.so=interval=0.001s -cp samples BasicSample
+g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/linux -I$JAVA_HOME/include -o libSmallProfiler.so -std=c++17 -shared -fPIC
+java -agentpath:./libSmallProfiler.so=interval=0.0001s -jar renaissance.jar all
 ```
 
-Don't set the interval too low, or you'll crash your JVM.
+The code essentially calls GetStackTrace on every jthread at every interval:
+
+```
+static void sampleThread(jthread thread) {
+  jvmtiFrameInfo gstFrames[MAX_DEPTH];
+  jint gstCount = 0;
+  jvmti->GetStackTrace(thread, 0, MAX_DEPTH, gstFrames, &gstCount);
+}
+```
+
+Running the agent on an x86_64 Linux with a `52d30087734ad95` JDK build) results in a segfault at:
+
+```
+V  [libjvm.so+0xb2fb09]  Klass::is_subclass_of(Klass const*) const+0x9  (klass.hpp:212)
+V  [libjvm.so+0xae1188]  JvmtiEnv::GetStackTrace(_jobject*, int, int, jvmtiFrameInfo*, int*)+0xa8  (jvmtiEnv.cpp:1718)
+V  [libjvm.so+0xa95493]  jvmti_GetStackTrace+0x113  (jvmtiEnter.cpp:1221)
+C  [libSmallProfiler.so+0x1486a]  _jvmtiEnv::GetStackTrace(_jobject*, int, int, jvmtiFrameInfo*, int*)+0x52
+C  [libSmallProfiler.so+0x137ce]  sampleThread(_jobject*)+0x78
+C  [libSmallProfiler.so+0x1388b]  sampleThreads()+0x7b
+C  [libSmallProfiler.so+0x13950]  sampleLoop()+0x5c
+C)
+```
 
 License
 -------
