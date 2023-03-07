@@ -34,6 +34,7 @@
 
 static jvmtiEnv* jvmti;
 static JNIEnv* env;
+static JavaVM* jvm;
 
 void ensureSuccess(jvmtiError err, const char *msg) {
   if (err != JVMTI_ERROR_NONE) {
@@ -132,6 +133,16 @@ class ThreadMap {
       return get_info(pid).value().id;
     }
 
+    bool contains(pid_t pid) {
+      const std::lock_guard<std::recursive_mutex> lock(m);
+      for (auto it : get_all_thread_ids()) {
+        if (it == pid) {
+          return true;
+        }
+      }
+      return false;
+    }
+
     const std::string& get_name(long id) {
       const std::lock_guard<std::recursive_mutex> lock(m);
       return names.at(id);
@@ -155,6 +166,20 @@ class ThreadMap {
       std::mt19937 g(rd());
       std::shuffle(threads.begin(), threads.end(), g);
       return std::vector(threads.begin(), threads.begin() + std::min(MAX_THREADS_PER_ITERATION, (int)threads.size()));
+    }
+
+    size_t size() {
+      const std::lock_guard<std::recursive_mutex> lock(m);
+      return map.size();
+    }
+
+    std::vector<pid_t> get_all_thread_ids() {
+      const std::lock_guard<std::recursive_mutex> lock(m);
+      std::vector<pid_t> ids;
+      for (const auto &it : map) {
+        ids.emplace_back(it.second.id);
+      }
+      return ids;
     }
 };
 
@@ -253,6 +278,80 @@ static void initASGCT() {
   }
 }
 
+void printMethod(FILE* stream, jmethodID method) {
+  if (method == nullptr) {
+    fprintf(stream, "<none>");
+    return;
+  }
+  JvmtiDeallocator<char> name;
+  JvmtiDeallocator<char> signature;
+  ensureSuccess(jvmti->GetMethodName(method, name.addr(), signature.addr(), NULL), "name");
+  jclass klass;
+  JvmtiDeallocator<char> className;
+  ensureSuccess(jvmti->GetMethodDeclaringClass(method, &klass), "decl");
+  ensureSuccess(jvmti->GetClassSignature(klass, className.addr(), NULL), "class");
+  fprintf(stream, "%s.%s%s", className.get(), name.get(), signature.get());
+}
+
+void printGSTFrame(FILE* stream, jvmtiFrameInfo frame) {
+  if (frame.location == -1) {
+    fprintf(stream, "Native frame");
+    printMethod(stream, frame.method);
+  } else {
+    fprintf(stream, "Java frame   ");
+    printMethod(stream, frame.method);
+    fprintf(stream, ": %d", (int)frame.location);
+  }
+}
+
+
+void printGSTTrace(FILE* stream, jvmtiFrameInfo* frames, int length) {
+  fprintf(stream, "GST Trace length: %d\n", length);
+  for (int i = 0; i < length; i++) {
+    fprintf(stream, "Frame %d: ", i);
+    printGSTFrame(stream, frames[i]);
+    fprintf(stream, "\n");
+  }
+  fprintf(stream, "GST Trace end\n");
+}
+
+bool isASGCTNativeFrame(ASGCT_CallFrame frame) {
+  return frame.lineno == -3;
+}
+
+void printASGCTFrame(FILE* stream, ASGCT_CallFrame frame) {
+  JvmtiDeallocator<char*> name;
+  jvmtiError err = jvmti->GetMethodName(frame.method_id, name.get(), NULL, NULL);
+  if (err != JVMTI_ERROR_NONE) {
+    fprintf(stream, "=== asgst sampler failed: Error in GetMethodName: %d", err);
+    return;
+  }
+  if (isASGCTNativeFrame(frame)) {
+    fprintf(stream, "Native frame ");
+    printMethod(stream, frame.method_id);
+  } else {
+    fprintf(stream, "Java frame   ");
+    printMethod(stream, frame.method_id);
+    fprintf(stream, ": %d", frame.lineno);
+  }
+}
+
+void printASGCTFrames(FILE* stream, ASGCT_CallFrame *frames, int length) {
+  for (int i = 0; i < length; i++) {
+    fprintf(stream, "Frame %d: ", i);
+    printASGCTFrame(stream, frames[i]);
+    fprintf(stream, "\n");
+  }
+}
+
+void printASGCTTrace(FILE* stream, ASGCT_CallTrace trace) {
+  fprintf(stream, "ASGCT Trace length: %d\n", trace.num_frames);
+  if (trace.num_frames > 0) {
+    printASGCTFrames(stream, trace.frames, trace.num_frames);
+  }
+  fprintf(stream, "ASGCT Trace end\n");
+}
+
 std::atomic<size_t> failedTraces = 0;
 std::atomic<size_t> totalTraces = 0;
 
@@ -261,17 +360,13 @@ std::atomic<size_t> brokenBecauseOfGCTError;
 std::atomic<size_t> brokenBecauseOfLengthMismatch;
 std::atomic<size_t> brokenBecauseOfFrameMismatch;
 
-int available_trace;
-int stored_traces;
-
 const int MAX_DEPTH = 512; // max number of frames to capture
 
-static ASGCT_CallFrame global_frames[MAX_DEPTH * MAX_THREADS_PER_ITERATION];
-static ASGCT_CallTrace global_traces[MAX_THREADS_PER_ITERATION];
+static ASGCT_CallFrame global_frames[MAX_DEPTH];
+static ASGCT_CallTrace global_trace;
 
 static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
-  asgct(&global_traces[available_trace++], MAX_DEPTH, ucontext);
-  stored_traces++;
+  asgct(&global_trace, MAX_DEPTH, ucontext);
 }
 
 static void printGCTError(jvmtiError err) {
@@ -300,7 +395,10 @@ static void printGCTError(jvmtiError err) {
   }
 }
 
-static void checkWithGCT(ASGCT_CallTrace asgctTrace, jthread thread) {
+std::atomic<bool> shouldStop = false;
+std::thread samplerThread;
+
+static void checkWithGCT(ASGCT_CallTrace asgctTrace, pid_t pid, jthread thread) {
   totalTraces++;
   if (asgctTrace.num_frames <= 0) {
     failedTraces++;
@@ -308,22 +406,34 @@ static void checkWithGCT(ASGCT_CallTrace asgctTrace, jthread thread) {
   }
   jvmtiFrameInfo gstFrames[MAX_DEPTH];
   jint gstCount = 0;
-  jvmtiError err = jvmti->GetStackTrace(thread, 0, MAX_DEPTH, gstFrames, &gstCount);
+  jvmtiError err;
+  while (!shouldStop && thread_map.contains(pid) && gstCount == 0) {
+    // maybe related to https://bugs.openjdk.org/browse/JDK-4937994
+    err = jvmti->GetStackTrace(thread, 0, MAX_DEPTH, gstFrames, &gstCount);
+  }
   if (err != JVMTI_ERROR_NONE) {
     brokenTraces++;
     brokenBecauseOfGCTError++;
     printGCTError(err);
     return;
   }
+  auto printTraces = [&]() {
+    printASGCTTrace(stderr, asgctTrace);
+    printGSTTrace(stderr, gstFrames, gstCount);
+  };
   if (asgctTrace.num_frames != gstCount) {
     brokenTraces++;
     brokenBecauseOfLengthMismatch++;
+    fprintf(stderr, "length mismatch asgct: %d, gst: %d\n", asgctTrace.num_frames, gstCount);
+    printTraces();
     return;
   }
   for (int i = 0; i < gstCount; i++) {
     if (asgctTrace.frames[i].method_id != gstFrames[i].method) {
       brokenTraces++;
       brokenBecauseOfFrameMismatch++;
+      fprintf(stderr, "frame mismatch at %d\n", i);
+      printTraces();
       return;
     }
   }
@@ -331,24 +441,21 @@ static void checkWithGCT(ASGCT_CallTrace asgctTrace, jthread thread) {
 
 
 static void handleThread(ValidThreadInfo info) {
-  assert(available_trace == 0);
   pthread_kill(info.pthread, SIGPROF);
-  checkWithGCT(global_traces[0], info.jthread);
+  checkWithGCT(global_trace, info.id, info.jthread);
 }
 
 static void initSampler() {
-  for (int i = 0; i < MAX_THREADS_PER_ITERATION; i++) {
-    global_traces[i].frames = global_frames + i * MAX_DEPTH;
-    global_traces[i].num_frames = 0;
-    global_traces[i].env_id = env;
-  }
+  global_trace.frames = global_frames;
+  global_trace.num_frames = 0;
+  global_trace.env_id = env;
   installSignalHandler(SIGPROF, signalHandler);
 }
 
 static void sampleThreads() {
-  available_trace = 0;
-  stored_traces = 0;
-
+  if (thread_map.size() == 0) {
+    return;
+  }
   auto threads = thread_map.get_shuffled_threads();
   auto thread = threads[0];
   auto info = thread_map.get_info(thread);
@@ -370,11 +477,9 @@ static void endSampler() {
   printValue("  Frame mismatch", brokenBecauseOfFrameMismatch);
 }
 
-std::atomic<bool> shouldStop = false;
-std::thread samplerThread;
-
 static void sampleLoop() {
-  
+  JNIEnv* newEnv;
+  jvm->AttachCurrentThread((void **) &newEnv, NULL);
   initSampler();
   std::chrono::nanoseconds interval{interval_ns};
   while (!shouldStop) {
@@ -437,10 +542,15 @@ static void JNICALL OnVMInit(jvmtiEnv *jvmti, JNIEnv *jni_env, jthread thread) {
   startSamplerThread();
 }
 
+static void JNICALL OnVMDeath(jvmtiEnv *jvmti, JNIEnv *jni_env) {
+  shouldStop = true;
+}
+
 extern "C" {
 
 static
-jint Agent_Initialize(JavaVM *jvm, char *options, void *reserved) {
+jint Agent_Initialize(JavaVM *_jvm, char *options, void *reserved) {
+  jvm = _jvm;
   initASGCT();
   parseOptions(options);
   jint res = jvm->GetEnv((void **) &jvmti, JVMTI_VERSION);
@@ -468,6 +578,7 @@ jint Agent_Initialize(JavaVM *jvm, char *options, void *reserved) {
   callbacks.ClassPrepare = &OnClassPrepare;
   callbacks.ThreadStart = &OnThreadStart;
   callbacks.ThreadEnd = &OnThreadEnd;
+  callbacks.VMDeath = &OnVMDeath;
 
   err = jvmti->SetEventCallbacks(&callbacks, sizeof(jvmtiEventCallbacks));
   if (err != JVMTI_ERROR_NONE) {
@@ -493,6 +604,22 @@ jint Agent_Initialize(JavaVM *jvm, char *options, void *reserved) {
   if (err != JVMTI_ERROR_NONE) {
     fprintf(
         stderr, "AgentInitialize: Error in SetEventNotificationMode for VM_INIT: %d\n",
+        err);
+    return JNI_ERR;
+  }
+
+  err = jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_VM_DEATH, NULL);
+  if (err != JVMTI_ERROR_NONE) {
+    fprintf(
+        stderr, "AgentInitialize: Error in SetEventNotificationMode for VM_DEATH: %d\n",
+        err);
+    return JNI_ERR;
+  }
+
+  err = jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_THREAD_END, NULL);
+  if (err != JVMTI_ERROR_NONE) {
+    fprintf(
+        stderr, "AgentInitialize: Error in SetEventNotificationMode for THREAD_END: %d\n",
         err);
     return JNI_ERR;
   }
