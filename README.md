@@ -16,14 +16,14 @@ javac samples/BasicSample.java
 
 # compile the small profiler agent
 # on mac
-g++ libSmallProfiler.cpp -I$JAVA_HOME/include/darwin -I$JAVA_HOME/include -o libSmallProfiler.dylib -std=c++17 -shared 
+g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/darwin -I$JAVA_HOME/include -o libSmallProfiler.so -std=c++17 -shared 
 # on linux
-g++ libSmallProfiler.cpp -I$JAVA_HOME/include/linux -I$JAVA_HOME/include -o libSmallProfiler.so -std=c++17 -shared
+g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/linux -I$JAVA_HOME/include -o libSmallProfiler.so -std=c++17 -shared
+# or just
+./build.sh
 
-# run them together on mac
-java -agentpath:cpp/libSmallProfiler.dylib=interval=0.001s -cp samples BasicSample
-# on linux
-java -agentpath:cpp/libSmallProfiler.so=interval=0.001s -cp samples BasicSample
+# run them together
+java -agentpath:libSmallProfiler.so=interval=0.001s -cp samples BasicSample
 ```
 
 Don't set the interval too low, or you'll crash your JVM.
