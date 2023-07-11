@@ -6,3 +6,9 @@ if [ -d "$JAVA_HOME/include/linux" ]; then
 else
   g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/darwin -I$JAVA_HOME/include -o libSmallProfiler.so -std=c++17 -shared
 fi
+
+(
+  cd samples
+  javac BasicSample.java
+  javac math/MathParser.java
+)

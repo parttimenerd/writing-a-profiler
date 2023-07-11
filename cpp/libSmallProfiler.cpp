@@ -49,8 +49,9 @@ static void processTraces(size_t num_threads) {
     if (trace.num_frames <= 0) {
       failedTraces++;
     } else {
+      std::cout << "Trace:\n";
       for (auto s : traceToStrings(trace)) {
-        std::cout << s << std::endl;
+        std::cout << " " << s << std::endl;
       }
       node.addTrace(traceToStrings(trace));
     }
