@@ -1,3 +1,7 @@
+Modification
+============
+Requires https://github.com/parttimenerd/jdk/tree/asgst_iterator (younger than 11 July might not work).
+
 Writing a Profiler from Scratch
 ===============================
 

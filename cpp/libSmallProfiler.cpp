@@ -10,11 +10,11 @@ size_t interval_ns = 1000000;  // 1ms
 
 #include "other.hpp"
 #include "flamegraph.hpp"
+#include "profile2.h"
 
 // our stuff
 
-
-
+thread_local ASGST_Queue *queue;
 
 std::atomic<size_t> failedTraces = 0;
 std::atomic<size_t> totalTraces = 0;
@@ -24,45 +24,51 @@ int stored_traces;
 
 const int MAX_DEPTH = 512; // max number of frames to capture
 
-static ASGCT_CallFrame global_frames[MAX_DEPTH * MAX_THREADS_PER_ITERATION];
-static ASGCT_CallTrace global_traces[MAX_THREADS_PER_ITERATION];
-
-static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
-  asgct(&global_traces[available_trace++], MAX_DEPTH, ucontext);
-  stored_traces++;
-}
-
-static void initSampler() {
-  for (int i = 0; i < MAX_THREADS_PER_ITERATION; i++) {
-    global_traces[i].frames = global_frames + i * MAX_DEPTH;
-    global_traces[i].num_frames = 0;
-    global_traces[i].env_id = env;
-  }
-  installSignalHandler(SIGPROF, signalHandler);
-}
-
 Node node{"main"};
 
-static void processTraces(size_t num_threads) {
-  for (int i = 0; i < num_threads; i++) {
-    auto& trace = global_traces[i];
-    if (trace.num_frames <= 0) {
-      failedTraces++;
-    } else {
-      std::cout << "Trace:\n";
-      for (auto s : traceToStrings(trace)) {
-        std::cout << " " << s << std::endl;
-      }
-      node.addTrace(traceToStrings(trace));
-    }
+static std::string methodToString(ASGST_Frame frame) {
+  char method_name[100];
+  char signature[100];
+  char class_name[100];
+  ASGST_MethodInfo info;
+  info.method_name = (char*)method_name;
+  info.method_name_length = 100;
+  info.signature = (char*)signature;
+  info.signature_length = 100;
+  info.generic_signature = nullptr;
+  ASGST_GetMethodInfo(frame.method, &info);
+  ASGST_ClassInfo class_info;
+  class_info.class_name = (char*)class_name;
+  class_info.class_name_length = 100;
+  class_info.generic_class_name = nullptr;
+  ASGST_GetClassInfo(info.klass, &class_info);
+  return std::string(class_info.class_name) + "." + std::string(info.method_name) + std::string(info.signature);
+}
+
+static void asgstHandler(ASGST_Iterator* iterator, void* queueArg, void* arg) {
+  std::vector<std::string> trace;
+  ASGST_Frame frame;
+  for (int count = 0; ASGST_NextFrame(iterator, &frame) > 0 && count < MAX_DEPTH; count++) {
+    trace.push_back(methodToString(frame));
+  }
+  node.addTrace(trace);
+}
+
+static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
+  if (queue) {
+    int r = ASGST_Enqueue(queue, ucontext, nullptr);
     totalTraces++;
+    if (r < 0) {
+      failedTraces++;
+      printf("Failed %d queue size %d\n", r, ASGST_QueueSize(queue));
+      ASGST_RunWithIterator(ucontext, 0, printFirstFrame, nullptr);
+    }
   }
 }
 
 static void sampleThreads() {
   available_trace = 0;
   stored_traces = 0;
-
   auto threads = thread_map.get_shuffled_threads();
   for (pid_t thread : threads) {
     auto info = thread_map.get_info(thread);
@@ -70,8 +76,6 @@ static void sampleThreads() {
       pthread_kill(info->pthread, SIGPROF);
     }
   }
-  while (stored_traces < threads.size());
-  processTraces(threads.size());
 }
 
 static void endSampler() {
@@ -87,7 +91,6 @@ std::thread samplerThread;
 
 static void sampleLoop() {
   jvm->AttachCurrentThreadAsDaemon((void**)&env, nullptr);
-  initSampler();
   std::chrono::nanoseconds interval{interval_ns};
   while (!shouldStop) {
     auto start = std::chrono::system_clock::now();
@@ -101,14 +104,16 @@ static void sampleLoop() {
   endSampler();
 }
 
-
-
+static void initQueue(JNIEnv* env) {
+  queue = ASGST_RegisterQueue(env, 100, 0, &asgstHandler, nullptr);
+}
 
 
 
 // complicated stuff
 
 static void startSamplerThread() {
+  installSignalHandler(SIGPROF, signalHandler);
   samplerThread = std::thread(sampleLoop);
 }
 
@@ -122,6 +127,7 @@ OnThreadStart(jvmtiEnv *jvmti_env,
   ensureSuccess(jvmti->GetThreadInfo(thread, &info), "GetThreadInfo");
   thread_map.add(get_thread_id(), info.name, thread);
   pthread_sigmask(SIG_UNBLOCK, &prof_signal_mask, NULL);
+  initQueue(jni_env);
 }
 
 void JNICALL
@@ -138,21 +144,6 @@ static void JNICALL OnVMInit(jvmtiEnv *jvmti, JNIEnv *jni_env, jthread thread) {
   sigemptyset(&prof_signal_mask);
   sigaddset(&prof_signal_mask, SIGPROF);
   OnThreadStart(jvmti, jni_env, thread);
-  // Get any previously loaded classes that won't have gone through the
-  // OnClassPrepare callback to prime the jmethods for AsyncGetCallTrace.
-  JvmtiDeallocator<jclass> classes;
-  jvmtiError err = jvmti->GetLoadedClasses(&class_count, classes.addr());
-  if (err != JVMTI_ERROR_NONE) {
-    fprintf(stderr, "OnVMInit: Error in GetLoadedClasses: %d\n", err);
-    return;
-  }
-
-  // Prime any class already loaded and try to get the jmethodIDs set up.
-  jclass *classList = classes.get();
-  for (int i = 0; i < class_count; ++i) {
-    GetJMethodIDs(classList[i]);
-  }
-
   startSamplerThread();
 }
 
@@ -160,7 +151,6 @@ extern "C" {
 
 static
 jint Agent_Initialize(JavaVM *_jvm, char *options, void *reserved) {
-  initASGCT();
   parseOptions(options);
   jvm = _jvm;
   jint res = jvm->GetEnv((void **) &jvmti, JVMTI_VERSION);
@@ -179,16 +169,16 @@ jint Agent_Initialize(JavaVM *_jvm, char *options, void *reserved) {
 
   jvmtiEventCallbacks callbacks;
   memset(&callbacks, 0, sizeof(callbacks));
-  callbacks.ClassLoad = &OnClassLoad;
   callbacks.VMInit = &OnVMInit;
-  callbacks.ClassPrepare = &OnClassPrepare;
   callbacks.ThreadStart = &OnThreadStart;
   callbacks.ThreadEnd = &OnThreadEnd;
 
   ensureSuccess(jvmti->SetEventCallbacks(&callbacks, sizeof(jvmtiEventCallbacks)), "EventCallbacks");
-  ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_LOAD, NULL), "ClassLoad");
-  ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_PREPARE, NULL), "ClassPrepare");
   ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_VM_INIT, NULL), "VMInit");
+  ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_THREAD_START, NULL),
+      "AgentInitialize: Error in SetEventNotificationMode for THREAD_START");
+  ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_THREAD_END, NULL),
+      "AgentInitialize: Error in SetEventNotificationMode for THREAD_END");
   return JNI_OK;
 }
 

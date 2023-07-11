@@ -1,3 +1,5 @@
+#pragma once
+
 #include <algorithm>
 #include <atomic>
 #include <assert.h>
@@ -18,6 +20,7 @@
 #include <vector>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <profile2.h>
 
 #include <pthread.h>
 
@@ -188,28 +191,6 @@ class JvmtiDeallocator {
   T* elem_;
 };
 
-static void GetJMethodIDs(jclass klass) {
-  jint method_count = 0;
-  JvmtiDeallocator<jmethodID> methods;
-  jvmtiError err = jvmti->GetClassMethods(klass, &method_count, methods.addr());
-
-  // If ever the GetClassMethods fails, just ignore it, it was worth a try.
-  if (err != JVMTI_ERROR_NONE && err != JVMTI_ERROR_CLASS_NOT_PREPARED) {
-    fprintf(stderr, "GetJMethodIDs: Error in GetClassMethods: %d\n", err);
-  }
-}
-
-// AsyncGetStackTrace needs class loading events to be turned on!
-static void JNICALL OnClassLoad(jvmtiEnv *jvmti, JNIEnv *jni_env,
-                                jthread thread, jclass klass) {
-}
-
-static void JNICALL OnClassPrepare(jvmtiEnv *jvmti, JNIEnv *jni_env,
-                                   jthread thread, jclass klass) {
-  // We need to do this to "prime the pump" and get jmethodIDs primed.
-  GetJMethodIDs(klass);
-}
-
 static SigAction installSignalHandler(int signo, SigAction action, SigHandler handler = NULL) {
     struct sigaction sa;
     struct sigaction oldsa;
@@ -227,43 +208,33 @@ static SigAction installSignalHandler(int signo, SigAction action, SigHandler ha
     return oldsa.sa_sigaction;
 }
 
-typedef struct {
-  jint lineno;         // BCI in the source file, or < 0 for native methods
-  jmethodID method_id; // method executed in this frame
-} ASGCT_CallFrame;
-
-typedef struct {
-  JNIEnv *env_id;   // Env where trace was recorded
-  jint num_frames; // number of frames in this trace, < 0 gives us an error code
-  ASGCT_CallFrame *frames; // recorded frames
-} ASGCT_CallTrace;
-
-typedef void (*ASGCTType)(ASGCT_CallTrace *, jint, void *);
-
-ASGCTType asgct;
-
-static void initASGCT() {
-  asgct = reinterpret_cast<ASGCTType>(dlsym(RTLD_DEFAULT, "AsyncGetCallTrace"));
-  if (asgct == NULL) {
-    fprintf(stderr, "=== ASGCT not found ===\n");
-    exit(1);
-  }
+void printFirstFrame(ASGST_Iterator* iterator, void* arg) {
+  ASGST_Frame frame;
+  ASGST_NextFrame(iterator, &frame);
+  char method_name[100];
+  char signature[100];
+  char class_name[100];
+  ASGST_MethodInfo info;
+  info.method_name = (char*)method_name;
+  info.method_name_length = 100;
+  info.signature = (char*)signature;
+  info.signature_length = 100;
+  info.generic_signature = nullptr;
+  ASGST_GetMethodInfo(frame.method, &info);
+  ASGST_ClassInfo class_info;
+  class_info.class_name = (char*)class_name;
+  class_info.class_name_length = 100;
+  class_info.generic_class_name = nullptr;
+  ASGST_GetClassInfo(info.klass, &class_info);
+  printf("  %s.%s\n", class_info.class_name, info.method_name);
 }
 
-std::vector<std::string> traceToStrings(ASGCT_CallTrace trace) {
-  std::vector<std::string> ret;
-  for (int i = 0; i < trace.num_frames; i++) {
-    jmethodID method = trace.frames[i].method_id;
-    JvmtiDeallocator<char> name;
-    JvmtiDeallocator<char> signature;
-    if (jvmti->GetMethodName(method, name.addr(), signature.addr(), nullptr) != JVMTI_ERROR_NONE) {
-      continue;
-    }
-    jclass klass;
-    JvmtiDeallocator<char> className;
-    jvmti->GetMethodDeclaringClass(method, &klass);
-    jvmti->GetClassSignature(klass, className.addr(), nullptr);
-    ret.push_back(std::string(className.get()) + std::string(name.get()) + std::string(signature.get()));
+const char* addrToNativeMethodName(void* addr) {
+  Dl_info dlinfo;
+
+  if (dladdr((void*)addr, &dlinfo) != 0) {
+    return dlinfo.dli_sname ? dlinfo.dli_sname : dlinfo.dli_fname;
+  } else {
+    return "unknown";
   }
-  return ret;
 }

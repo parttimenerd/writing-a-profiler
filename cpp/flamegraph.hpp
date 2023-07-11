@@ -3,16 +3,14 @@
 #include <string>
 #include <iostream>
 #include <memory>
+#include <vector>
+#include <mutex>
 
 class Node {
   std::string method;
   std::map<std::string, std::unique_ptr<Node>> children;
   long samples = 0;
-
-public:
-  Node(std::string method): method(method) {
-    printf("%s\n", method.c_str());
-  }
+  std::mutex m;
 
   Node& getChild(std::string method) {
     if (children.find(method) == children.end()) {
@@ -27,7 +25,13 @@ public:
     }
   }
 
+public:
+
+  Node(std::string method): method(method) {
+  }
+
   void addTrace(std::vector<std::string> trace) {
+    std::lock_guard<std::mutex> lock(m);
     addTrace(trace, trace.size() - 1);
   }
 
