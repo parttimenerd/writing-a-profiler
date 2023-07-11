@@ -99,6 +99,7 @@ struct ValidThreadInfo {
     bool is_running;
     long id;
 };
+
 class ThreadMap {
   std::recursive_mutex m;
   std::unordered_map<pid_t, ValidThreadInfo> map;

@@ -11,7 +11,6 @@ class Node {
 
 public:
   Node(std::string method): method(method) {
-    printf("%s\n", method.c_str());
   }
 
   Node& getChild(std::string method) {

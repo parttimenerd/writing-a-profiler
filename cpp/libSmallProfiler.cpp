@@ -1,7 +1,3 @@
-/*
- * Based on the linAsyncGetCallTraceTest.cpp and libAsyncGetStackTraceSampler.cpp from the OpenJDK project.
- */
-
 #include <fstream>
 #include <stddef.h>
 
