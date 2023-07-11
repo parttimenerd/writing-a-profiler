@@ -94,7 +94,7 @@ bool is_thread_running(jthread thread) {
 
 
 struct ValidThreadInfo {
-    jthread jthread;
+    jthread jthreadId;
     pthread_t pthread;
     bool is_running;
     long id;
@@ -108,7 +108,7 @@ class ThreadMap {
 
     void add(pid_t pid, std::string name, jthread thread) {
       const std::lock_guard<std::recursive_mutex> lock(m);
-      map[pid] = ValidThreadInfo{.jthread = thread, .pthread = pthread_self(), .id = (long)names.size()};
+      map[pid] = ValidThreadInfo{.jthreadId = thread, .pthread = pthread_self(), .id = (long)names.size()};
       names.emplace_back(name);
     }
 
@@ -138,7 +138,7 @@ class ThreadMap {
       const std::lock_guard<std::recursive_mutex> lock(m);
       std::vector<pid_t> pids;
       for (const auto &it : map) {
-        if (wall_clock_mode || is_thread_running(it.second.jthread)) {
+        if (wall_clock_mode || is_thread_running(it.second.jthreadId)) {
           pids.emplace_back(it.first);
         }
       }
