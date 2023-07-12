@@ -117,13 +117,11 @@ static void asgstHandler(ASGST_Iterator* iterator, void* queueArg, void* arg) {
   std::vector<std::string> trace;
   std::vector<StoredTraceEntry> sTrace;
   ASGST_Frame frame;
-  for (int count = 0; ASGST_NextFrame(iterator, &frame) > 0 && count < MAX_DEPTH; count++) {
+  printf("asgstHandler\n");
+  /*for (int count = 0; ASGST_NextFrame(iterator, &frame) > 0 && count < MAX_DEPTH; count++) {
     if (frame.sp && (!storedTrace.empty() && storedTrace.first().sp == frame.sp)) {
       std::vector<std::string> names = storedTrace.names();
-      printf("obtained from store\n");
-      for (auto name : names) {
-        printf("    %s\n", name.c_str());
-      }
+      printf("obtained from store %s...\n", methodToString(frame).c_str());
       trace.insert(trace.end(), names.begin(), names.end());
       if (count > DIFFERENCE) {
         sTrace.insert(sTrace.end(), storedTrace.begin(), storedTrace.end());
@@ -138,7 +136,7 @@ static void asgstHandler(ASGST_Iterator* iterator, void* queueArg, void* arg) {
   if (storedTrace.empty()) {
     storedTrace.reset(sTrace);
   }
-  node.addTrace(trace);
+  node.addTrace(trace);*/
 }
 
 static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
@@ -147,8 +145,8 @@ static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
     totalTraces++;
     if (r < 0) {
       failedTraces++;
-      //printf("Failed %d queue size %d\n", r, ASGST_QueueSize(queue));
-      //ASGST_RunWithIterator(ucontext, 0, printFirstFrame, nullptr);
+      printf("Failed %d queue size %d\n", r, ASGST_QueueSize(queue));
+      ASGST_RunWithIterator(ucontext, 0, printFirstFrame, nullptr);
     }
   }
 }
@@ -213,6 +211,7 @@ OnThreadStart(jvmtiEnv *jvmti_env,
             jthread thread) {
   jvmtiThreadInfo info;           
   ensureSuccess(jvmti->GetThreadInfo(thread, &info), "GetThreadInfo");
+  printf("thread %s\n", info.name);
   thread_map.add(get_thread_id(), info.name, thread);
   pthread_sigmask(SIG_UNBLOCK, &prof_signal_mask, NULL);
   initQueue(jni_env);
@@ -227,14 +226,12 @@ OnThreadEnd(jvmtiEnv *jvmti_env,
 }
 
 static void JNICALL OnVMInit(jvmtiEnv *jvmti, JNIEnv *jni_env, jthread thread) {
-  if (env != nullptr) {
-    return;
+  if (env == nullptr) {
+    env = jni_env;
+    sigemptyset(&prof_signal_mask);
+    sigaddset(&prof_signal_mask, SIGPROF);
+    startSamplerThread();
   }
-  env = jni_env;
-  sigemptyset(&prof_signal_mask);
-  sigaddset(&prof_signal_mask, SIGPROF);
-  OnThreadStart(jvmti, jni_env, thread);
-  startSamplerThread();
 }
 
 extern "C" {

@@ -34,7 +34,7 @@
 bool wall_clock_mode = true;
 
 jvmtiEnv* jvmti;
-JNIEnv* env;
+JNIEnv* env = nullptr;
 JavaVM* jvm;
 
 void ensureSuccess(jvmtiError err, const char *msg) {
@@ -210,7 +210,10 @@ static SigAction installSignalHandler(int signo, SigAction action, SigHandler ha
 
 void printFirstFrame(ASGST_Iterator* iterator, void* arg) {
   ASGST_Frame frame;
-  ASGST_NextFrame(iterator, &frame);
+  int ret = ASGST_NextFrame(iterator, &frame);
+  if (ret <= 0) {
+    return;
+  }
   char method_name[100];
   char signature[100];
   char class_name[100];
@@ -226,7 +229,7 @@ void printFirstFrame(ASGST_Iterator* iterator, void* arg) {
   class_info.class_name_length = 100;
   class_info.generic_class_name = nullptr;
   ASGST_GetClassInfo(info.klass, &class_info);
-  printf("  %s.%s\n", class_info.class_name, info.method_name);
+  printf(" %d %s.%s\n", ret, class_info.class_name, info.method_name);
 }
 
 const char* addrToNativeMethodName(void* addr) {
