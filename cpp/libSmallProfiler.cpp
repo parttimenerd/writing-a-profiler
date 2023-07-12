@@ -10,12 +10,15 @@ const int MAX_THREADS_PER_ITERATION = 8;
 size_t interval_ns = 1000000;  // 1ms
 
 #include "profile2.h"
+#include <vector>
+#include <algorithm>
 #include "other.hpp"
 #include "flamegraph.hpp"
 
 // our stuff
 
-thread_local ASGST_Queue *queue;
+thread_local ASGST_Queue* queue;
+thread_local ASGST_FrameMark* frameMark;
 
 std::atomic<size_t> failedTraces = 0;
 std::atomic<size_t> totalTraces = 0;
@@ -24,6 +27,70 @@ int available_trace;
 int stored_traces;
 
 const int MAX_DEPTH = 512; // max number of frames to capture
+
+const size_t DIFFERENCE = 5;
+
+struct StoredTraceEntry {
+  std::string name;
+  void* sp;
+};
+
+class StoredTrace {
+  std::vector<StoredTraceEntry> _trace;
+  size_t _firstValidIdx = 0;
+
+  void setWatermark() {
+    void* sp = empty() ? nullptr : first().sp;
+    ASGST_MoveFrameMark(frameMark, sp);
+  }
+public:
+  size_t size() const { return _trace.size() - _firstValidIdx; }
+  bool empty() const { return size() == 0; }
+
+  StoredTraceEntry operator[](size_t idx) { return _trace[idx + _firstValidIdx]; }
+  StoredTraceEntry first() const { return _trace[_firstValidIdx]; }
+  void moveValidIdxBack(size_t inc = DIFFERENCE, void* foundSP = nullptr) { 
+    _firstValidIdx = std::min(_firstValidIdx + inc, _trace.size());
+    for (size_t i = _firstValidIdx + inc; i < _trace.size(); i++) {
+      if (_trace.at(i).sp && (foundSP == nullptr || foundSP < _trace.at(i).sp)) { // ignore frames without stack pointers
+        _firstValidIdx = i;
+        break;
+      }
+    }
+    setWatermark();
+  }
+  void reset(std::vector<StoredTraceEntry> &trace) {
+    std::vector<StoredTraceEntry> newTrace = trace;
+    for (size_t i = _firstValidIdx; i < _trace.size(); i++) {
+      newTrace.push_back(_trace[i]);
+    }
+    _trace = newTrace;
+    _firstValidIdx = 0;
+    printf("reset size %lu traceSize %lu\n", size(), trace.size());
+    moveValidIdxBack();
+  }
+
+  std::vector<std::string> names() const {
+    std::vector<std::string> names;
+    for (size_t i = _firstValidIdx; i < _trace.size(); i++) {
+      names.push_back(_trace[i].name);
+    }
+    return names;
+  }
+
+  auto begin() const {
+    return _trace.begin() + _firstValidIdx;
+  }
+  auto end() const {
+    return _trace.end();
+  }
+};
+
+thread_local StoredTrace storedTrace;
+
+void frameMarkHandler(ASGST_FrameMark* frameMark, ASGST_Iterator* iter, void* arg) {
+  storedTrace.moveValidIdxBack();
+}
 
 Node node{"main"};
 
@@ -48,9 +115,28 @@ static std::string methodToString(ASGST_Frame frame) {
 
 static void asgstHandler(ASGST_Iterator* iterator, void* queueArg, void* arg) {
   std::vector<std::string> trace;
+  std::vector<StoredTraceEntry> sTrace;
   ASGST_Frame frame;
   for (int count = 0; ASGST_NextFrame(iterator, &frame) > 0 && count < MAX_DEPTH; count++) {
-    trace.push_back(methodToString(frame));
+    if (frame.sp && (!storedTrace.empty() && storedTrace.first().sp == frame.sp)) {
+      std::vector<std::string> names = storedTrace.names();
+      printf("obtained from store\n");
+      for (auto name : names) {
+        printf("    %s\n", name.c_str());
+      }
+      trace.insert(trace.end(), names.begin(), names.end());
+      if (count > DIFFERENCE) {
+        sTrace.insert(sTrace.end(), storedTrace.begin(), storedTrace.end());
+        storedTrace.reset(sTrace);
+      }
+      break;
+    }
+    std::string name = methodToString(frame);
+    trace.push_back(name);
+    sTrace.push_back(StoredTraceEntry{name, frame.sp});
+  }
+  if (storedTrace.empty()) {
+    storedTrace.reset(sTrace);
   }
   node.addTrace(trace);
 }
@@ -61,8 +147,8 @@ static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
     totalTraces++;
     if (r < 0) {
       failedTraces++;
-      printf("Failed %d queue size %d\n", r, ASGST_QueueSize(queue));
-      ASGST_RunWithIterator(ucontext, 0, printFirstFrame, nullptr);
+      //printf("Failed %d queue size %d\n", r, ASGST_QueueSize(queue));
+      //ASGST_RunWithIterator(ucontext, 0, printFirstFrame, nullptr);
     }
   }
 }
@@ -107,6 +193,7 @@ static void sampleLoop() {
 
 static void initQueue(JNIEnv* env) {
   queue = ASGST_RegisterQueue(env, 100, 0, &asgstHandler, nullptr);
+  frameMark = ASGST_RegisterFrameMark(env, &frameMarkHandler, 0, (void*)nullptr);
 }
 
 
