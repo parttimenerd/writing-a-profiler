@@ -9,6 +9,7 @@
 const int MAX_THREADS_PER_ITERATION = 8;
 size_t interval_ns = 1000000;  // 1ms
 
+#include "profile2.h"
 #include "other.hpp"
 #include "flamegraph.hpp"
 
