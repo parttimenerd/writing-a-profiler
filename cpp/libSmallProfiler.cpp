@@ -2,6 +2,7 @@
  * Based on the linAsyncGetCallTraceTest.cpp and libAsyncGetStackTraceSampler.cpp from the OpenJDK project.
  */
 
+#include "profile2.h"
 #include <fstream>
 #include <stddef.h>
 
@@ -10,7 +11,6 @@ size_t interval_ns = 1000000;  // 1ms
 
 #include "other.hpp"
 #include "flamegraph.hpp"
-#include "profile2.h"
 
 // our stuff
 
@@ -139,7 +139,9 @@ OnThreadEnd(jvmtiEnv *jvmti_env,
 }
 
 static void JNICALL OnVMInit(jvmtiEnv *jvmti, JNIEnv *jni_env, jthread thread) {
-  jint class_count = 0;
+  if (env != nullptr) {
+    return;
+  }
   env = jni_env;
   sigemptyset(&prof_signal_mask);
   sigaddset(&prof_signal_mask, SIGPROF);
