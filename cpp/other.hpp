@@ -208,9 +208,7 @@ static SigAction installSignalHandler(int signo, SigAction action, SigHandler ha
     return oldsa.sa_sigaction;
 }
 
-void printFirstFrame(ASGST_Iterator* iterator, void* arg) {
-  ASGST_Frame frame;
-  ASGST_NextFrame(iterator, &frame);
+void printFrame(ASGST_Frame &frame) {
   char method_name[100];
   char signature[100];
   char class_name[100];
@@ -229,6 +227,12 @@ void printFirstFrame(ASGST_Iterator* iterator, void* arg) {
   printf("  %s.%s\n", class_info.class_name, info.method_name);
 }
 
+void printFirstFrame(ASGST_Iterator* iterator, void* arg) {
+  ASGST_Frame frame;
+  ASGST_NextFrame(iterator, &frame);
+  printFrame(frame);
+}
+
 const char* addrToNativeMethodName(void* addr) {
   Dl_info dlinfo;
 
@@ -236,5 +240,60 @@ const char* addrToNativeMethodName(void* addr) {
     return dlinfo.dli_sname ? dlinfo.dli_sname : dlinfo.dli_fname;
   } else {
     return "unknown";
+  }
+}
+/* ASGST_NO_THREAD          = -1, // thread is not here
+  ASGST_THREAD_EXIT        = -2, // dying thread
+  ASGST_UNSAFE_STATE       = -3, // thread is in unsafe state
+  ASGST_NO_TOP_JAVA_FRAME  = -4, // no top java frame
+  ASGST_ENQUEUE_NO_QUEUE   = -5, // no queue registered
+  ASGST_ENQUEUE_FULL_QUEUE = -6, // safepoint queue is full
+*/
+
+const char* errorCodeToString(int code) {
+  switch (code) {
+  case ASGST_NO_THREAD:
+    return "thread is not here";
+  case ASGST_THREAD_EXIT:
+    return "dying thread";
+  case ASGST_UNSAFE_STATE:
+    return "thread is in unsafe state";
+  case ASGST_NO_TOP_JAVA_FRAME:
+    return "no top java frame";
+  case ASGST_ENQUEUE_NO_QUEUE:
+    return "no queue registered";
+  case ASGST_ENQUEUE_FULL_QUEUE:
+    return "safepoint queue is full";
+  case ASGST_ENQUEUE_OTHER_ERROR:
+    return "other queue error";
+  case ASGST_NO_FRAME:
+    return "no frame";
+  case 1:
+    return "ok";
+  default:
+    return "unknown error";
+  }
+}
+
+typedef struct {
+  jint lineno;         // BCI in the source file, or < 0 for native methods
+  jmethodID method_id; // method executed in this frame
+} ASGCT_CallFrame;
+
+typedef struct {
+  JNIEnv *env_id;   // Env where trace was recorded
+  jint num_frames; // number of frames in this trace, < 0 gives us an error code
+  ASGCT_CallFrame *frames; // recorded frames
+} ASGCT_CallTrace;
+
+typedef void (*ASGCTType)(ASGCT_CallTrace *, jint, void *);
+
+ASGCTType asgct;
+
+static void initASGCT() {
+  asgct = reinterpret_cast<ASGCTType>(dlsym(RTLD_DEFAULT, "AsyncGetCallTrace"));
+  if (asgct == NULL) {
+    fprintf(stderr, "=== ASGCT not found ===\n");
+    exit(1);
   }
 }

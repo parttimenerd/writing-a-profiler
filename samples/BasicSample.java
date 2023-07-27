@@ -2,7 +2,7 @@ public class BasicSample {
 
     public void waitForever() throws InterruptedException {
         System.out.print("Waiting forever...");
-        for (int i = 0; i < 200; i++) {
+        for (int i = 0; i < 150; i++) {
             fib(i / 5);
         }
         System.out.println("done");
