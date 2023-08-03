@@ -1,6 +1,8 @@
 Modification
 ============
-Requires https://github.com/parttimenerd/jdk/tree/asgst_iterator (younger than 11 July might not work).
+Requires https://github.com/parttimenerd/jdk/tree/asgst_iterator (younger than 3. August might not work).
+Actually checks the correctness of the ASGST stack walking at safepoints.
+
 
 Writing a Profiler from Scratch
 ===============================

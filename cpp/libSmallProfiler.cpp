@@ -5,19 +5,42 @@
 #include "jni.h"
 #include "profile2.h"
 #include <cstddef>
+#include <cstdlib>
 #include <fstream>
 #include <stddef.h>
+#include <array>
+#include <atomic>
 
 const int MAX_THREADS_PER_ITERATION = 8;
 size_t interval_ns = 1000000;  // 1ms
 
 #include "other.hpp"
-#include "flamegraph.hpp"
 
 // our stuff
 
 thread_local ASGST_Queue *queue;
 thread_local JNIEnv* local_env = nullptr;
+
+struct TopMethodEntry {
+  ASGST_Method method;
+  int bci;
+  ASGST_Frame frame;
+
+  bool valid() const {
+    return method != nullptr && method == frame.method && bci == frame.bci;
+  }
+};
+
+std::array<TopMethodEntry, 1000000> topMethods;
+std::atomic<int> topMethodsNextIndex = 0;
+
+int addTopMethod(ASGST_Method method, int bci, ASGST_Frame frame) {
+  size_t index = topMethodsNextIndex++ % topMethods.size();
+  topMethods[index].method = method;
+  topMethods[index].bci = bci;
+  topMethods[index].frame = frame;
+  return index;
+}
 
 static void GetJMethodIDs(jclass klass) {
   jint method_count = 0;
@@ -36,6 +59,7 @@ static void JNICALL OnClassPrepare(jvmtiEnv *jvmti, JNIEnv *jni_env,
   GetJMethodIDs(klass);
 }
 
+std::atomic<size_t> asgctAndAsgstFailedTraces = 0;
 std::atomic<size_t> failedTraces = 0;
 std::atomic<size_t> totalTraces = 0;
 std::atomic<size_t> successfullyHandlesTraces = 0;
@@ -43,13 +67,24 @@ std::atomic<size_t> successfullyHandlesWithCompressedTraces = 0;
 std::atomic<size_t> queueFullCount = 0;
 std::atomic<size_t> compressed = 0;
 std::atomic<size_t> asgctSuccess = 0;
-
+std::atomic<size_t> failedToObtainFirstFrame = 0;
+std::atomic<size_t> asgstUnsafeState = 0;
+std::atomic<size_t> asgctASGSTMethodMismatch = 0;
+std::atomic<size_t> asgctASGSTBCIMismatch = 0;
+std::atomic<size_t> checkCount = 0;
+std::atomic<size_t> checkFailureCount = 0;
+std::atomic<size_t> checkBCIFailureCount = 0;
+std::atomic<size_t> checkFailedASGCTBCIZero = 0;
+std::atomic<size_t> checkBCIDifferenceLargerThenTen = 0;
+std::atomic<size_t> checkBCIDifferenceLargerThenTwenty = 0;
+std::atomic<size_t> checkBCIFailedAndNotInlinedCompiled = 0;
+std::atomic<size_t> checkWithSignalASGSTFailed = 0;
+std::atomic<size_t> checkWithSignalASGSTMethodMismatch = 0;
+std::atomic<size_t> checkWithSignalASGSTBCIMismatch = 0;
 
 const int MAX_DEPTH = 1024; // max number of frames to capture
 
-Node node{"main"};
-
-static std::string methodToString(ASGST_Frame frame) {
+static std::string methodToString(ASGST_Method method) {
   char method_name[100];
   char signature[100];
   char class_name[100];
@@ -59,7 +94,7 @@ static std::string methodToString(ASGST_Frame frame) {
   info.signature = (char*)signature;
   info.signature_length = 100;
   info.generic_signature = nullptr;
-  ASGST_GetMethodInfo(frame.method, &info);
+  ASGST_GetMethodInfo(method, &info);
   ASGST_ClassInfo class_info;
   class_info.class_name = (char*)class_name;
   class_info.class_name_length = 100;
@@ -69,25 +104,82 @@ static std::string methodToString(ASGST_Frame frame) {
 }
 
 static void asgstHandler(ASGST_Iterator* iterator, void* queueArg, void* arg) {
-  size_t traceEncounters = (size_t)arg;
+  if ((int)(long)arg < 0) {
+    return;
+  }
+  auto m = topMethods.at((int)(long)arg);
   std::vector<std::string> trace;
   ASGST_Frame frame;
-  for (int count = 0; ASGST_NextFrame(iterator, &frame) > 0 && count < MAX_DEPTH; count++) {
-    trace.push_back(methodToString(frame));
-  }
-  /*ASGST_RewindIterator(iterator);
-  for (int count = 0; ASGST_NextFrame(iterator, &frame) > 0 && count < 1; count++) {
-    printf("  %s %d\n", methodToString(frame).c_str(), frame.bci);
-  }*/
-  node.addTrace(trace, traceEncounters);
   successfullyHandlesTraces++;
-  successfullyHandlesWithCompressedTraces += traceEncounters;
+  int ret = ASGST_NextFrame(iterator, &frame);
+  checkCount++;
+  if (ret <= 0) {
+        checkFailureCount++;
+        failedToObtainFirstFrame++;
+    printf("Failed to get first frame %d\n", ret);
+    return;
+  }
+  if (frame.method != m.method || std::max(-1, frame.bci) != std::max(-1, m.bci)) {
+    checkFailureCount++;
+    if (frame.bci != m.bci && frame.method == m.method) {
+      checkBCIFailureCount++;
+      if (m.bci == 0) {
+        checkFailedASGCTBCIZero++;
+      }
+      if (std::abs(frame.bci - m.bci) > 10) {
+        checkBCIDifferenceLargerThenTen++;
+      }
+      if (std::abs(frame.bci - m.bci) > 20) {
+        checkBCIDifferenceLargerThenTwenty++;
+      }
+      if (frame.type != ASGST_FRAME_JAVA_INLINED && frame.comp_level > 0) {
+        checkBCIFailedAndNotInlinedCompiled++;
+      }
+      printf("First frame bci is not as expected\n");
+    } else {
+      printf("First frame is not the method we expected:\n");
+    }
+    printf("  asgct %s:%d\n", methodToString(m.method).c_str(), m.bci);
+    printf("  own   %s:%d inlined %d compiled %d\n", methodToString(frame.method).c_str(), frame.bci, frame.type == ASGST_FRAME_JAVA_INLINED, frame.comp_level > 0);
+    int count = 0;
+    ASGST_Frame frame;
+    while (ASGST_NextFrame(iterator, &frame) > 0 && count < 2) {
+      printf("       %s inlined=%d compiled=%d\n", methodToString(frame.method).c_str(), frame.type == ASGST_FRAME_JAVA_INLINED, frame.comp_level > 0);
+      count++;
+    }
+  }
+  if (frame.bci != m.frame.bci || frame.method != m.frame.method) {
+    checkWithSignalASGSTFailed++;
+    if (frame.bci != m.frame.bci && frame.method == m.frame.method) {
+      checkWithSignalASGSTBCIMismatch++;
+      printf("First frame bci is not as expected (asgst)\n");
+      printf("frame info: pc %p sp %p fp %p compiled %d inlined %d\n", frame.pc, frame.sp, frame.fp, frame.comp_level > 0, frame.type == ASGST_FRAME_JAVA_INLINED);
+      printf("m.fra info: pc %p sp %p fp %p compiled %d inlined %d\n", m.frame.pc, m.frame.sp, m.frame.fp, m.frame.comp_level > 0, m.frame.type == ASGST_FRAME_JAVA_INLINED);
+    } else {
+      checkWithSignalASGSTMethodMismatch++;
+      printf("First frame is not the method we expected (asgst):\n");
+    }
+    printf("  asgst %s:%d\n", methodToString(m.method).c_str(), m.bci);
+    printf("  own   %s:%d inlined %d compiled %d\n", methodToString(frame.method).c_str(), frame.bci, frame.type == ASGST_FRAME_JAVA_INLINED, frame.comp_level > 0);
+  }
 }
 
-void printLastFrames(ASGST_Iterator* iterator, void* arg) {
+void printFirstFrames(ASGST_Iterator* iterator, void* arg) {
   ASGST_Frame frame;
-  for (int count = 0; ASGST_NextFrame(iterator, &frame) > 0 && count < 2; count++) {
-    printf("%s%s %d\n", (char*)arg, methodToString(frame).c_str(), frame.bci);
+  int count;
+  for (count = 0; ASGST_NextFrame(iterator, &frame) > 0 && count < 2; count++) {
+    printf("%s%s %d inlined=%d compiled=%d\n", (char*)arg, methodToString(frame.method).c_str(), frame.bci, frame.type == ASGST_FRAME_JAVA_INLINED, frame.comp_level > 0);
+  }
+  if (count == 0) {
+    printf("%s<empty>\n", (char*)arg);
+  }
+}
+
+void obtainFirstFrame(ASGST_Iterator* iterator, ASGST_Frame* frame) {
+  int ret = ASGST_NextFrame(iterator, frame);
+  if (ret <= 0) {
+    printf("Failed to get first frame %d\n", ret);
+    return;
   }
 }
 
@@ -96,46 +188,52 @@ static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
     ASGST_QueueSizeInfo size = ASGST_GetQueueSizeInfo(queue);
     totalTraces++;
 
-    void* pc;
-    int ret = ASGST_GetEnqueuablePC(ucontext, &pc);
+    ASGST_QueueElement elem;
+    int ret = ASGST_GetEnqueuableElement(ucontext, &elem);
+    //ASGST_RunWithIterator(ucontext, 0, &printLastFrames, (void*)"  ct ");
     ASGCT_CallFrame frames[10];
     ASGCT_CallTrace trace;
     trace.frames = frames;
     trace.env_id = local_env;
     asgct(&trace, 10, ucontext);
+    int mIndex = -1;
+    /*for (int i = 0; i < trace.num_frames && i < 2; i++) {
+      ASGST_Method m = ASGST_JMethodIDToMethod(trace.frames[i].method_id);
+      if (m != nullptr) {
+        printf("asgct     %s\n", methodToString(m).c_str());
+      }
+    }*/
     if (trace.num_frames > 0) {
+      auto mId = ASGST_JMethodIDToMethod(trace.frames[0].method_id);
+
+      ASGST_Frame frame;
+      int ret = ASGST_RunWithIterator(ucontext, 0, (void (*)(ASGST_Iterator *, void *))&obtainFirstFrame, &frame);
+      if (ret == ASGST_UNSAFE_STATE) {
+        asgstUnsafeState++;
+      } else if (frame.method != mId) {
+        asgctASGSTMethodMismatch++;
+        printf("asgct and asgst method mismatch in signal handler: %s != %s\n", methodToString(mId).c_str(), methodToString(frame.method).c_str());
+      } else if (std::max(-1, frame.bci) != std::max(-1, trace.frames[0].lineno)) {
+        asgctASGSTBCIMismatch++;
+        printf("asgct and asgst bci mismatch in signal handler: %d != %d\n", frame.bci, trace.frames[0].lineno);
+      }
+            mIndex = addTopMethod(mId, trace.frames[0].lineno, frame);
+
       asgctSuccess++;
     }
-   /* if (trace.num_frames > 0 && ret != 1) {
-      printf("asgst failed where asgct didn't: %s (%d)\n", errorCodeToString(ret), ret);
-          int ret = ASGST_GetEnqueuablePC(ucontext, &pc);
-
-          asgct(&trace, 10, ucontext);
-
-    } else if (trace.num_frames <= 0 && ret == 1) {
-      printf("asgst failed where asgct did\n");
-    }*/
     if (ret != 1) {
-      int ret = ASGST_GetEnqueuablePC(ucontext, &pc);
-      failedTraces++;
+      asgctAndAsgstFailedTraces++;
+      if (trace.num_frames > 0) {
+        int ret = ASGST_GetEnqueuableElement(ucontext, &elem);
+        failedTraces++;
+        printf("  asgst error %d\n", ret);
+      }
       return;
     }
-    // we do some nifty compression
-    // we encode the number of hits in the argument
-    // the -1st element is the last enqueued element
-    // this compression works well for Java methods that call long running C++ methods
-    ASGST_QueueElement* last = ASGST_GetQueueElement(queue, -1);
-    if (last != nullptr && last->pc == pc) {
-      last->arg = (void*)((size_t)last->arg + 1);
-      compressed++;
-    } else {
-      //ASGST_RunWithIterator(ucontext, 0, &printLastFrames, (void*)"    enqueue ");
-      //int r = ASGST_EnqueueElement(queue, {pc, (void*)1});
-      int r = ASGST_EnqueueElement(queue,{pc, (void*)1});
+          int r = ASGST_Enqueue(queue, ucontext, (void*)(size_t)mIndex);
       if (r == ASGST_ENQUEUE_FULL_QUEUE) {
         queueFullCount++;
       }
-    }
   }
 }
 
@@ -160,28 +258,60 @@ static void sampleThreads() {
 }
 
 static void endSampler() {
-  printf("Failed traces: %10zu\n", failedTraces.load());
-  printf("Total traces:  %10zu\n", totalTraces.load());
-  printf("Failed ratio:  %10.2f%%\n", (double)failedTraces.load() / totalTraces.load() * 100);
-  printf("Stored traces: %10zu\n", successfullyHandlesTraces.load());
-  printf("Stored ratio:  %10.2f%%\n", (double)successfullyHandlesTraces.load() / totalTraces.load() * 100);
-  printf("Stored + Compressed/Submitted: %10.2f%%\n", (double)successfullyHandlesWithCompressedTraces.load()  / (totalTraces - failedTraces) * 100);
-  printf("Queue full:    %10zu\n", queueFullCount.load());
-  printf("Compressed:    %10zu\n", compressed.load());
-  printf("ASGCT success: %10zu\n", asgctSuccess.load());
-  printf("ASGCT failure ratio:   %10.2f%%\n", (double)(totalTraces - asgctSuccess) / totalTraces * 100);
-  std::ofstream flames("flames.html");
-  node.writeAsHTML(flames, 100 /* browsers hate large flamegraphs */);
-}
+  size_t total_traces = totalTraces.load();
+  size_t asgct_and_asgst_failed_traces = asgctAndAsgstFailedTraces.load();
+  size_t failed_traces = failedTraces.load();
+  size_t stored_traces = successfullyHandlesTraces.load();
+  size_t queue_full_count = queueFullCount.load();
+  size_t compressed_count = compressed.load();
+  size_t asgct_success_count = asgctSuccess.load();
+  size_t check_count = checkCount.load();
+  size_t check_failure_count = checkFailureCount.load();
+  size_t check_bci_failure_count = checkBCIFailureCount.load();
+  size_t check_failed_asgct_bci_zero_count = checkFailedASGCTBCIZero.load();
+  size_t failed_to_obtain_first_frame_count = failedToObtainFirstFrame.load();
+  size_t check_bci_difference_larger_then_ten = checkBCIDifferenceLargerThenTen.load();
+  size_t check_bci_difference_larger_then_twenty = checkBCIDifferenceLargerThenTwenty.load();
+  size_t check_bci_failed_and_not_inlined_compiled = checkBCIFailedAndNotInlinedCompiled.load();
+  size_t asgst_unsafe_state = asgstUnsafeState.load();
+  size_t asgct_asgst_method_mismatch = asgctASGSTMethodMismatch.load();
+  size_t asgct_asgst_bci_mismatch = asgctASGSTBCIMismatch.load();
+  size_t check_with_signal_asgst_failed = checkWithSignalASGSTFailed.load();
+  size_t check_with_signal_asgst_method_mismatch = checkWithSignalASGSTMethodMismatch.load();
+  size_t check_with_signal_asgst_bci_mismatch = checkWithSignalASGSTBCIMismatch.load();
 
+  printf("--------------------------------------------------------------\n");
+  printf("| %-45s | %10zu |\n", "Total traces", total_traces);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT and ASGST failed traces", asgct_and_asgst_failed_traces, (double)asgct_and_asgst_failed_traces / total_traces * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGST unsafe state", asgst_unsafe_state, (double)asgst_unsafe_state / total_traces * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT/ASGST method mismatch", asgct_asgst_method_mismatch, (double)asgct_asgst_method_mismatch / total_traces * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT/ASGST bci mismatch", asgct_asgst_bci_mismatch, (double)asgct_asgst_bci_mismatch / total_traces * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "Failed traces", failed_traces, (double)failed_traces / total_traces * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "Stored traces", stored_traces, (double)stored_traces / total_traces * 100);
+  printf("| %-45s | %10zu |\n", "Queue full count", queue_full_count);
+  printf("| %-45s | %10zu |\n", "Compressed count", compressed_count);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT success count", asgct_success_count, (double)asgct_success_count / total_traces * 100);
+  printf("| %-45s | %10zu |\n", "ASGCT check count", check_count);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT check failure count", check_failure_count, (double)check_failure_count / check_count * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT check BCI failure count", check_bci_failure_count, (double)check_bci_failure_count / check_count * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT check BCI failed + ASGCT BCI zero count", check_failed_asgct_bci_zero_count, (double)check_failed_asgct_bci_zero_count / check_count * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT check BCI difference larger then 10", check_bci_difference_larger_then_ten, (double)check_bci_difference_larger_then_ten / check_count * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT check BCI difference larger then 20", check_bci_difference_larger_then_twenty, (double)check_bci_difference_larger_then_twenty / check_count * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT check BCI failed -inlined compiled", check_bci_failed_and_not_inlined_compiled, (double)check_bci_failed_and_not_inlined_compiled / check_count * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "Failed to obtain first frame count", failed_to_obtain_first_frame_count, (double)failed_to_obtain_first_frame_count / check_count * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGST check with signal failed", check_with_signal_asgst_failed, (double)check_with_signal_asgst_failed / check_count * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGST check with signal method mismatch", check_with_signal_asgst_method_mismatch, (double)check_with_signal_asgst_method_mismatch / check_count * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGST check with signal bci mismatch", check_with_signal_asgst_bci_mismatch, (double)check_with_signal_asgst_bci_mismatch / check_count * 100);
+  printf("--------------------------------------------------------------\n");
+}
 std::atomic<bool> shouldStop = false;
 std::thread samplerThread;
 
 static void sampleLoop() {
 
   JavaVMAttachArgs attachArgs = {
-    JNI_VERSION_20, 
-    (char*)"Profiling Thread", 
+    JNI_VERSION_20,
+    (char*)"Profiling Thread",
     nullptr
   };
   jvm->AttachCurrentThreadAsDaemon((void**)&env, &attachArgs);
@@ -200,7 +330,7 @@ static void sampleLoop() {
 }
 
 static void initQueue(JNIEnv* env) {
-  queue = ASGST_RegisterQueue(env, 10000, 0, &asgstHandler, nullptr);
+  queue = ASGST_RegisterQueue(env, 100000, 0, &asgstHandler, nullptr);
   ASGST_SetOnQueueProcessingStart(queue, 0, false, beforeQueueProcessingHandler, nullptr);
 }
 
@@ -220,7 +350,7 @@ OnThreadStart(jvmtiEnv *jvmti_env,
             JNIEnv* jni_env,
             jthread thread) {
   local_env = jni_env;
-  jvmtiThreadInfo info;           
+  jvmtiThreadInfo info;
   ensureSuccess(jvmti->GetThreadInfo(thread, &info), "GetThreadInfo");
   // check that thread is not notification or profiling thread
   if (info.is_daemon) {
