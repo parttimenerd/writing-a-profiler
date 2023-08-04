@@ -3,6 +3,11 @@ Modification
 Requires https://github.com/parttimenerd/jdk/tree/asgst_iterator (younger than 3. August might not work).
 Actually checks the correctness of the ASGST stack walking at safepoints.
 
+Sample usage:
+
+```
+java -agentpath:libSmallProfiler.so=interval=0.001s -cp samples math.MathParser
+```
 
 Writing a Profiler from Scratch
 ===============================
