@@ -10,9 +10,7 @@ class Node {
   long samples = 0;
 
 public:
-  Node(std::string method): method(method) {
-    printf("%s\n", method.c_str());
-  }
+  Node(std::string method): method(method) {}
 
   Node& getChild(std::string method) {
     if (children.find(method) == children.end()) {

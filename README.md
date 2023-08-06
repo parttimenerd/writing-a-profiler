@@ -1,11 +1,7 @@
 Writing a Profiler from Scratch
 ===============================
 
-This repository belongs to my article series with the same name. 
-It is a step-by-step guide to writing a profiler from scratch.
-
-This repository currently looks a bit barren, it contains just the example Java code and
-the introductory agent code. More will come as the article series progresses.
+This repository belongs to my blog post [AsyncGetCallTrace Reworked: Frame by Frame with an Iterative Touch!](https://mostlynerdless.de/blog/2023/08/05/asyncgetcalltrace-reworked-frame-by-frame-with-an-iterative-touch). The profiler requires [a modified OpenJDK](https://github.com/parttimenerd/jdk/tree/asgst_iterator).
 
 How to run this all?
 --------------------
@@ -14,16 +10,20 @@ How to run this all?
 # compile the Java sample code
 javac samples/BasicSample.java
 
-# compile the small profiler agent
-# on mac
-g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/darwin -I$JAVA_HOME/include -o libSmallProfiler.so -std=c++17 -shared 
-# on linux
-g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/linux -I$JAVA_HOME/include -o libSmallProfiler.so -std=c++17 -shared
-# or just
+# compile all
 ./build.sh
 
 # run them together
 java -agentpath:libSmallProfiler.so=interval=0.001s -cp samples BasicSample
+```
+
+```
+Usage: -agentpath:libSmallProfiler.so=<options>
+Options:
+  interval=<time>  - sampling interval, default 1ms
+  cpu              - sample CPU time instead of wall clock time
+  output=<file>    - output file, default flames.html
+  printTraces      - print stack traces to stderr
 ```
 
 Don't set the interval too low, or you'll crash your JVM.

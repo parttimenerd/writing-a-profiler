@@ -2,19 +2,18 @@
  * Based on the linAsyncGetCallTraceTest.cpp and libAsyncGetStackTraceSampler.cpp from the OpenJDK project.
  */
 
+#include "jni.h"
 #include <fstream>
 #include <stddef.h>
+#include <profile2.h>
+
 
 const int MAX_THREADS_PER_ITERATION = 8;
-size_t interval_ns = 1000000;  // 1ms
 
 #include "other.hpp"
 #include "flamegraph.hpp"
 
-// our stuff
-
-
-
+Options options;
 
 std::atomic<size_t> failedTraces = 0;
 std::atomic<size_t> totalTraces = 0;
@@ -22,22 +21,65 @@ std::atomic<size_t> totalTraces = 0;
 int available_trace;
 int stored_traces;
 
-const int MAX_DEPTH = 512; // max number of frames to capture
+const int MAX_DEPTH = 128; // max number of frames to capture
 
-static ASGCT_CallFrame global_frames[MAX_DEPTH * MAX_THREADS_PER_ITERATION];
-static ASGCT_CallTrace global_traces[MAX_THREADS_PER_ITERATION];
+static std::string methodToString(ASGST_Method method) {
+  char method_name[100];
+  char signature[100];
+  char class_name[100];
+  ASGST_MethodInfo info;
+  info.method_name = (char*)method_name;
+  info.method_name_length = 100;
+  info.signature = (char*)signature;
+  info.signature_length = 100;
+  info.generic_signature = nullptr;
+  ASGST_GetMethodInfo(method, &info);
+  ASGST_ClassInfo class_info;
+  class_info.class_name = (char*)class_name;
+  class_info.class_name_length = 100;
+  class_info.generic_class_name = nullptr;
+  ASGST_GetClassInfo(info.klass, &class_info);
+  return std::string(class_info.class_name) + "." + std::string(info.method_name) + std::string(info.signature);
+}
+
+struct CallTrace {
+  std::array<ASGST_Frame, MAX_DEPTH> frames;
+  int num_frames;
+
+  std::vector<std::string> to_strings() const {
+    std::vector<std::string> strings;
+    for (int i = 0; i < num_frames; i++) {
+      strings.push_back(methodToString(frames[i].method));
+    }
+    return strings;
+  }
+};
+
+static CallTrace global_traces[MAX_THREADS_PER_ITERATION];
+
+void storeTrace(ASGST_Iterator* iterator, void* arg) {
+  CallTrace *trace = (CallTrace*)arg;
+  ASGST_Frame frame;
+  int count;
+  for (count = 0; ASGST_NextFrame(iterator, &frame) == 1 && count < MAX_DEPTH; count++) {
+    trace->frames[count] = frame;  
+  }
+  trace->num_frames = count;
+}
 
 static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
-  asgct(&global_traces[available_trace++], MAX_DEPTH, ucontext);
+  CallTrace &trace = global_traces[available_trace++];
+  int ret = ASGST_RunWithIterator(ucontext, 0, &storeTrace, &trace);
+  if (ret >= 2) {
+    ret = 0;
+  }
+  if (ret <= 0) {
+    trace.num_frames = ret;
+  }
   stored_traces++;
 }
 
 static void initSampler() {
-  for (int i = 0; i < MAX_THREADS_PER_ITERATION; i++) {
-    global_traces[i].frames = global_frames + i * MAX_DEPTH;
-    global_traces[i].num_frames = 0;
-    global_traces[i].env_id = env;
-  }
   installSignalHandler(SIGPROF, signalHandler);
 }
 
@@ -49,11 +91,13 @@ static void processTraces(size_t num_threads) {
     if (trace.num_frames <= 0) {
       failedTraces++;
     } else {
-      std::cout << "Trace:\n";
-      for (auto s : traceToStrings(trace)) {
-        std::cout << " " << s << std::endl;
+      if (options.printTraces) {
+        std::cerr << "Trace:\n";
+        for (auto s : trace.to_strings()) {
+          std::cerr << " " << s << std::endl;
+        }
       }
-      node.addTrace(traceToStrings(trace));
+      node.addTrace(trace.to_strings());
     }
     totalTraces++;
   }
@@ -63,7 +107,7 @@ static void sampleThreads() {
   available_trace = 0;
   stored_traces = 0;
 
-  auto threads = thread_map.get_shuffled_threads();
+  auto threads = thread_map.get_shuffled_threads(MAX_THREADS_PER_ITERATION, options.wall_clock_mode);
   for (pid_t thread : threads) {
     auto info = thread_map.get_info(thread);
     if (info) {
@@ -78,7 +122,7 @@ static void endSampler() {
   printf("Failed traces: %10zu\n", failedTraces.load());
   printf("Total traces:  %10zu\n", totalTraces.load());
   printf("Failed ratio:  %10.2f%%\n", (double)failedTraces.load() / totalTraces.load() * 100);
-  std::ofstream flames("flames.html");
+  std::ofstream flames(options.output_file);
   node.writeAsHTML(flames, 100);
 }
 
@@ -86,9 +130,10 @@ std::atomic<bool> shouldStop = false;
 std::thread samplerThread;
 
 static void sampleLoop() {
+  JNIEnv *env;
   jvm->AttachCurrentThreadAsDaemon((void**)&env, nullptr);
   initSampler();
-  std::chrono::nanoseconds interval{interval_ns};
+  std::chrono::nanoseconds interval{options.interval_ns};
   while (!shouldStop) {
     auto start = std::chrono::system_clock::now();
     sampleThreads();
@@ -100,13 +145,6 @@ static void sampleLoop() {
   }
   endSampler();
 }
-
-
-
-
-
-
-// complicated stuff
 
 static void startSamplerThread() {
   samplerThread = std::thread(sampleLoop);
@@ -133,35 +171,17 @@ OnThreadEnd(jvmtiEnv *jvmti_env,
 }
 
 static void JNICALL OnVMInit(jvmtiEnv *jvmti, JNIEnv *jni_env, jthread thread) {
-  jint class_count = 0;
-  env = jni_env;
   sigemptyset(&prof_signal_mask);
   sigaddset(&prof_signal_mask, SIGPROF);
   OnThreadStart(jvmti, jni_env, thread);
-  // Get any previously loaded classes that won't have gone through the
-  // OnClassPrepare callback to prime the jmethods for AsyncGetCallTrace.
-  JvmtiDeallocator<jclass> classes;
-  jvmtiError err = jvmti->GetLoadedClasses(&class_count, classes.addr());
-  if (err != JVMTI_ERROR_NONE) {
-    fprintf(stderr, "OnVMInit: Error in GetLoadedClasses: %d\n", err);
-    return;
-  }
-
-  // Prime any class already loaded and try to get the jmethodIDs set up.
-  jclass *classList = classes.get();
-  for (int i = 0; i < class_count; ++i) {
-    GetJMethodIDs(classList[i]);
-  }
-
   startSamplerThread();
 }
 
 extern "C" {
 
 static
-jint Agent_Initialize(JavaVM *_jvm, char *options, void *reserved) {
-  initASGCT();
-  parseOptions(options);
+jint Agent_Initialize(JavaVM *_jvm, char *opts, void *reserved) {
+  options = Options::parseOptions(opts);
   jvm = _jvm;
   jint res = jvm->GetEnv((void **) &jvmti, JVMTI_VERSION);
   if (res != JNI_OK || jvmti == NULL) {
@@ -179,15 +199,11 @@ jint Agent_Initialize(JavaVM *_jvm, char *options, void *reserved) {
 
   jvmtiEventCallbacks callbacks;
   memset(&callbacks, 0, sizeof(callbacks));
-  callbacks.ClassLoad = &OnClassLoad;
   callbacks.VMInit = &OnVMInit;
-  callbacks.ClassPrepare = &OnClassPrepare;
   callbacks.ThreadStart = &OnThreadStart;
   callbacks.ThreadEnd = &OnThreadEnd;
 
   ensureSuccess(jvmti->SetEventCallbacks(&callbacks, sizeof(jvmtiEventCallbacks)), "EventCallbacks");
-  ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_LOAD, NULL), "ClassLoad");
-  ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_PREPARE, NULL), "ClassPrepare");
   ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_VM_INIT, NULL), "VMInit");
   return JNI_OK;
 }
