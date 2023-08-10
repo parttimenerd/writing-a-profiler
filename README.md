@@ -1,15 +1,12 @@
 Writing a Profiler from Scratch
 ===============================
 
-This repository belongs to my blog post [AsyncGetCallTrace Reworked: Frame by Frame with an Iterative Touch!](https://mostlynerdless.de/blog/2023/08/05/asyncgetcalltrace-reworked-frame-by-frame-with-an-iterative-touch). The profiler requires [a modified OpenJDK](https://github.com/parttimenerd/jdk/tree/asgst_iterator).
+This repository belongs to my blog post [Taming the Bias: Unbiased Safepoint-Based Stack Walking](https://mostlynerdless.de/blog/2023/08/05/taming-the-bias-unbiased-safepoint-based-stack-walking). The profiler requires [a modified OpenJDK](https://github.com/parttimenerd/jdk/tree/asgst_iterator).
 
 How to run this all?
 --------------------
 
 ```sh
-# compile the Java sample code
-javac samples/BasicSample.java
-
 # compile all
 ./build.sh
 

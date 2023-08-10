@@ -4,6 +4,7 @@
 
 #include "jni.h"
 #include <fstream>
+#include <mutex>
 #include <stddef.h>
 #include <profile2.h>
 
@@ -16,12 +17,12 @@ const int MAX_THREADS_PER_ITERATION = 8;
 Options options;
 
 std::atomic<size_t> failedTraces = 0;
+std::atomic<size_t> queueFullTraces = 0;
 std::atomic<size_t> totalTraces = 0;
 
-int available_trace;
-int stored_traces;
-
 const int MAX_DEPTH = 64; // max number of frames to capture
+
+thread_local ASGST_Queue* queue = nullptr;
 
 static std::string methodToString(ASGST_Method method) {
   char method_name[100];
@@ -55,58 +56,44 @@ struct CallTrace {
   }
 };
 
-static CallTrace global_traces[MAX_THREADS_PER_ITERATION];
+// we can acquire locks during safepoints
+std::mutex nodeLock;
+Node node{"main"};
 
-void storeTrace(ASGST_Iterator* iterator, void* arg) {
-  CallTrace *trace = (CallTrace*)arg;
+void asgstHandler(ASGST_Iterator* iterator, void* queueArg, void* arg) {
+  std::vector<std::string> names;
   ASGST_Frame frame;
   int count;
   for (count = 0; ASGST_NextFrame(iterator, &frame) == 1 && count < MAX_DEPTH; count++) {
-    trace->frames[count] = frame;  
+    names.push_back(methodToString(frame.method));
   }
-  trace->num_frames = count;
+  // lets use locks to deal with the concurrency
+  std::lock_guard<std::mutex> lock{nodeLock};
+  node.addTrace(names);
 }
 
 static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
-  CallTrace &trace = global_traces[available_trace++];
-  int ret = ASGST_RunWithIterator(ucontext, 0, &storeTrace, &trace);
-  if (ret >= 2) {
-    ret = 0;
+  totalTraces++;
+  if (queue == nullptr) {
+    failedTraces++;
+    return;
   }
-  if (ret <= 0) {
-    trace.num_frames = ret;
+  int res = ASGST_Enqueue(queue, ucontext, (void*)nullptr);
+  if (res != 1) {
+    failedTraces++;
+    if (res == ASGST_ENQUEUE_FULL_QUEUE) {
+      // we could do some compression here
+      // but not in this example
+      queueFullTraces++;
+    }
   }
-  stored_traces++;
 }
 
 static void initSampler() {
   installSignalHandler(SIGPROF, signalHandler);
 }
 
-Node node{"main"};
-
-static void processTraces(size_t num_threads) {
-  for (int i = 0; i < num_threads; i++) {
-    auto& trace = global_traces[i];
-    if (trace.num_frames <= 0) {
-      failedTraces++;
-    } else {
-      if (options.printTraces) {
-        std::cerr << "Trace:\n";
-        for (auto s : trace.to_strings()) {
-          std::cerr << " " << s << std::endl;
-        }
-      }
-      node.addTrace(trace.to_strings());
-    }
-    totalTraces++;
-  }
-}
-
 static void sampleThreads() {
-  available_trace = 0;
-  stored_traces = 0;
-
   auto threads = thread_map.get_shuffled_threads(MAX_THREADS_PER_ITERATION, options.wall_clock_mode);
   for (pid_t thread : threads) {
     auto info = thread_map.get_info(thread);
@@ -114,14 +101,13 @@ static void sampleThreads() {
       pthread_kill(info->pthread, SIGPROF);
     }
   }
-  while (stored_traces < threads.size());
-  processTraces(threads.size());
 }
 
 static void endSampler() {
   printf("Failed traces: %10zu\n", failedTraces.load());
   printf("Total traces:  %10zu\n", totalTraces.load());
   printf("Failed ratio:  %10.2f%%\n", (double)failedTraces.load() / totalTraces.load() * 100);
+  printf("Queue full:    %10zu\n", queueFullTraces.load());
   std::ofstream flames(options.output_file);
   node.writeAsHTML(flames, MAX_DEPTH, (int)(totalTraces.load() / 500));
 }
@@ -156,6 +142,8 @@ void JNICALL
 OnThreadStart(jvmtiEnv *jvmti_env,
             JNIEnv* jni_env,
             jthread thread) {
+  // the queue is large, but aren't doing any compression, so we need it
+  queue = ASGST_RegisterQueue(jni_env, 10'000, 0, &asgstHandler, (void*)nullptr);
   jvmtiThreadInfo info;           
   ensureSuccess(jvmti->GetThreadInfo(thread, &info), "GetThreadInfo");
   thread_map.add(get_thread_id(), info.name, thread);
