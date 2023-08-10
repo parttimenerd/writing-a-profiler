@@ -21,7 +21,7 @@ std::atomic<size_t> totalTraces = 0;
 int available_trace;
 int stored_traces;
 
-const int MAX_DEPTH = 128; // max number of frames to capture
+const int MAX_DEPTH = 64; // max number of frames to capture
 
 static std::string methodToString(ASGST_Method method) {
   char method_name[100];
@@ -123,7 +123,7 @@ static void endSampler() {
   printf("Total traces:  %10zu\n", totalTraces.load());
   printf("Failed ratio:  %10.2f%%\n", (double)failedTraces.load() / totalTraces.load() * 100);
   std::ofstream flames(options.output_file);
-  node.writeAsHTML(flames, 100);
+  node.writeAsHTML(flames, MAX_DEPTH, (int)(totalTraces.load() / 500));
 }
 
 std::atomic<bool> shouldStop = false;

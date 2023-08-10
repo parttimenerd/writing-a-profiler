@@ -32,18 +32,20 @@ public:
   /**
     * Write in d3-flamegraph format
     */
-  void writeAsJson(std::ofstream &s, int maxDepth) {
+  void writeAsJson(std::ofstream &s, int maxDepth, int minValue = 0) {
       s << "{ \"name\": \"" << method << "\", \"value\": " << samples << ", \"children\": [";
       if (maxDepth > 1) {
           for (auto& [m, child] : children) {
+            if (child->samples >= minValue) {
               child->writeAsJson(s, maxDepth - 1);
               s << ",";
+            }
           }
       }
       s << "]}";
   }
 
-  void writeAsHTML(std::ofstream &s, int maxDepth) {
+  void writeAsHTML(std::ofstream &s, int maxDepth, int minValue = 0) {
     s << R"B(
             <head>
               <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/d3-flame-graph@4.1.3/dist/d3-flamegraph.css">
@@ -56,7 +58,7 @@ public:
               var chart = flamegraph().width(window.innerWidth);
               d3.select("#chart").datum(
               )B";
-    writeAsJson(s, maxDepth);
+    writeAsJson(s, maxDepth, minValue);
     s << R"B(
             ).call(chart);
               window.onresize = () => chart.width(window.innerWidth);
