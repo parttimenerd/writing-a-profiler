@@ -22,19 +22,14 @@ How to run this all?
 --------------------
 
 ```sh
-# compile the Java sample code
-javac samples/BasicSample.java
-
-# compile the small profiler agent
-# on mac
-g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/darwin -I$JAVA_HOME/include -o libSmallProfiler.so -std=c++17 -shared 
-# on linux
-g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/linux -I$JAVA_HOME/include -o libSmallProfiler.so -std=c++17 -shared
-# or just
+# compile the Java sample code and the native agent
 ./build.sh
 
 # run them together
 java -agentpath:libSmallProfiler.so=interval=0.001s -cp samples BasicSample
+
+# or for the native sample
+java -agentpath:libSmallProfiler.so -cp samples -Djava.library.path=`pwd`/samples/nat nat.Native
 ```
 
 Don't set the interval too low, or you'll crash your JVM.

@@ -12,6 +12,7 @@
 #include <atomic>
 
 const int MAX_THREADS_PER_ITERATION = 8;
+const int MAX_ASGCT_DEPTH = 8;
 size_t interval_ns = 1000000;  // 1ms
 
 #include "other.hpp"
@@ -25,6 +26,10 @@ struct TopMethodEntry {
   ASGST_Method method;
   int bci;
   ASGST_Frame frame;
+  std::array<ASGCT_CallFrame, MAX_ASGCT_DEPTH> asgctFrames;
+  int asgctFramesCount = 0;
+  std::array<ASGST_Frame, MAX_ASGCT_DEPTH> asgstFrames;
+  int asgstFramesCount = 0;
 
   bool valid() const {
     return method != nullptr && method == frame.method && bci == frame.bci;
@@ -34,11 +39,19 @@ struct TopMethodEntry {
 std::array<TopMethodEntry, 1000000> topMethods;
 std::atomic<int> topMethodsNextIndex = 0;
 
-int addTopMethod(ASGST_Method method, int bci, ASGST_Frame frame) {
+int addTopMethod(ASGST_Method method, int bci, ASGST_Frame frame, ASGCT_CallFrame* asgctFrames, int asgctFramesCount, std::array<ASGST_Frame, MAX_ASGCT_DEPTH> asgstFrames, int asgstFramesCount) {
   size_t index = topMethodsNextIndex++ % topMethods.size();
   topMethods[index].method = method;
   topMethods[index].bci = bci;
   topMethods[index].frame = frame;
+  for (int i = 0; i < asgctFramesCount; i++) {
+    topMethods[index].asgctFrames[i] = asgctFrames[i];
+  }
+  topMethods[index].asgctFramesCount = asgctFramesCount;
+  for (int i = 0; i < asgstFramesCount; i++) {
+    topMethods[index].asgstFrames[i] = asgstFrames[i];
+  }
+  topMethods[index].asgstFramesCount = asgstFramesCount;
   return index;
 }
 
@@ -144,9 +157,24 @@ static void asgstHandler(ASGST_Iterator* iterator, void* queueArg, void* arg) {
     int count = 0;
     ASGST_Frame frame;
     while (ASGST_NextFrame(iterator, &frame) > 0 && count < 2) {
-      printf("       %s inlined=%d compiled=%d\n", methodToString(frame.method).c_str(), frame.type == ASGST_FRAME_JAVA_INLINED, frame.comp_level > 0);
+      printf("       %s inlined=%d compiled=%d pc=%p\n", methodToString(frame.method).c_str(), frame.type == ASGST_FRAME_JAVA_INLINED, frame.comp_level > 0, frame.pc);
       count++;
     }
+    for (int i = 0; i < m.asgctFramesCount; i++) {
+      auto f = m.asgctFrames[i];
+      if (f.method_id != 0) {
+        ASGST_Method m = ASGST_JMethodIDToMethod(f.method_id);
+        printf("  -- asgct     %s\n", methodToString(m).c_str());
+      }
+    }
+    printf(" ... \n");
+    for (int i = 0; i < m.asgstFramesCount; i++) {
+      auto f = m.asgstFrames[i];
+      if (f.method != nullptr) {
+        printf("  -- asgst     %s:%d inlined=%d compiled=%d pc=%p\n", methodToString(f.method).c_str(), f.bci, f.type == ASGST_FRAME_JAVA_INLINED, f.comp_level > 0, f.pc);
+      }
+    }
+    printf("end\n");
   }
   if (frame.bci != m.frame.bci || frame.method != m.frame.method) {
     checkWithSignalASGSTFailed++;
@@ -159,7 +187,7 @@ static void asgstHandler(ASGST_Iterator* iterator, void* queueArg, void* arg) {
       checkWithSignalASGSTMethodMismatch++;
       printf("First frame is not the method we expected (asgst):\n");
     }
-    printf("  asgst %s:%d\n", methodToString(m.method).c_str(), m.bci);
+    printf("  asgst %s:%d\n", methodToString(m.method).c_str(), m.frame.bci);
     printf("  own   %s:%d inlined %d compiled %d\n", methodToString(frame.method).c_str(), frame.bci, frame.type == ASGST_FRAME_JAVA_INLINED, frame.comp_level > 0);
   }
 }
@@ -176,11 +204,39 @@ void printFirstFrames(ASGST_Iterator* iterator, void* arg) {
 }
 
 void obtainFirstFrame(ASGST_Iterator* iterator, ASGST_Frame* frame) {
-  int ret = ASGST_NextFrame(iterator, frame);
+  int ret;
+  while ((ret = ASGST_NextFrame(iterator, frame)) == 1) {
+    if (frame->type != ASGST_FRAME_JAVA_NATIVE) {
+      return;
+    }
+  }
   if (ret <= 0) {
     printf("Failed to get first frame %d\n", ret);
     return;
   }
+}
+
+int findNonNativeFrameIndex(ASGCT_CallTrace trace) {
+  for (int i = 0; i < trace.num_frames; i++) {
+    if (trace.frames[i].lineno != -3) {
+      return i;
+    }
+  }
+  return -1;
+}
+
+struct ColRes {
+  std::array<ASGST_Frame, MAX_ASGCT_DEPTH> asgstFrames;
+  int asgstFramesCount = 0;
+};
+
+void collectFrames(ASGST_Iterator* iterator, ColRes* res) {
+  ASGST_Frame frame;
+  int count;
+  for (count = 0; ASGST_NextFrame(iterator, &frame) > 0 && count < MAX_ASGCT_DEPTH; count++) {
+    res->asgstFrames[count] = frame;
+  }
+  res->asgstFramesCount = count;
 }
 
 static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
@@ -191,20 +247,28 @@ static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
     ASGST_QueueElement elem;
     int ret = ASGST_GetEnqueuableElement(ucontext, &elem);
     //ASGST_RunWithIterator(ucontext, 0, &printLastFrames, (void*)"  ct ");
-    ASGCT_CallFrame frames[10];
+    ASGCT_CallFrame frames[MAX_ASGCT_DEPTH];
     ASGCT_CallTrace trace;
     trace.frames = frames;
     trace.env_id = local_env;
-    asgct(&trace, 10, ucontext);
+    asgct(&trace, MAX_ASGCT_DEPTH, ucontext);
     int mIndex = -1;
-    /*for (int i = 0; i < trace.num_frames && i < 2; i++) {
+    /*printf("------\n");
+    for (int i = 0; i < trace.num_frames && i < 4; i++) {
       ASGST_Method m = ASGST_JMethodIDToMethod(trace.frames[i].method_id);
       if (m != nullptr) {
         printf("asgct     %s\n", methodToString(m).c_str());
       }
-    }*/
+    }
+    printf("------\n");*/
     if (trace.num_frames > 0) {
-      auto mId = ASGST_JMethodIDToMethod(trace.frames[0].method_id);
+      int nonNativeIndex = findNonNativeFrameIndex(trace);
+      if (nonNativeIndex == -1) {
+        asgctAndAsgstFailedTraces++;
+        return;
+      }
+      auto topASGCTFrame = trace.frames[nonNativeIndex];
+      auto mId = ASGST_JMethodIDToMethod(topASGCTFrame.method_id);
 
       ASGST_Frame frame;
       int ret = ASGST_RunWithIterator(ucontext, 0, (void (*)(ASGST_Iterator *, void *))&obtainFirstFrame, &frame);
@@ -213,12 +277,14 @@ static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
       } else if (frame.method != mId) {
         asgctASGSTMethodMismatch++;
         printf("asgct and asgst method mismatch in signal handler: %s != %s\n", methodToString(mId).c_str(), methodToString(frame.method).c_str());
-      } else if (std::max(-1, frame.bci) != std::max(-1, trace.frames[0].lineno)) {
+      } else if (std::max(-1, frame.bci) != std::max(-1, topASGCTFrame.lineno)) {
         asgctASGSTBCIMismatch++;
-        printf("asgct and asgst bci mismatch in signal handler: %d != %d\n", frame.bci, trace.frames[0].lineno);
+        printf("asgct and asgst bci mismatch in signal handler: %d != %d\n", frame.bci, topASGCTFrame.lineno);
       }
-            mIndex = addTopMethod(mId, trace.frames[0].lineno, frame);
-
+      ColRes asgstFrames;
+      int asgstFramesCount = 0;
+      ASGST_RunWithIterator(ucontext, 0, (void (*)(ASGST_Iterator *, void *))&collectFrames, &asgstFrames);
+      mIndex = addTopMethod(mId, topASGCTFrame.lineno, frame, trace.frames, trace.num_frames, asgstFrames.asgstFrames, asgstFrames.asgstFramesCount);
       asgctSuccess++;
     }
     if (ret != 1) {
@@ -231,6 +297,8 @@ static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
       return;
     }
           int r = ASGST_Enqueue(queue, ucontext, (void*)(size_t)mIndex);
+          auto enqElem = ASGST_GetQueueElement(queue, -1);
+          printf("  enqueued pc %p fp %p sp %p\n", enqElem->pc, enqElem->fp, enqElem->sp);
       if (r == ASGST_ENQUEUE_FULL_QUEUE) {
         queueFullCount++;
       }
