@@ -18,6 +18,8 @@
 #include <vector>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <condition_variable>
+#include <queue>
 
 #include <pthread.h>
 
@@ -245,3 +247,33 @@ std::vector<std::string> traceToStrings(jmethodID* trace, int num_frames) {
   }
   return ret;
 }
+
+template <typename T>
+class SynchronizedQueue {
+private:
+  std::queue<T> queue;
+  std::mutex mutex;
+  std::condition_variable cv;
+
+public:
+  void push(const T& item) {
+    std::lock_guard<std::mutex> lock(mutex);
+    queue.push(item);
+    cv.notify_one();
+  }
+
+  bool pop(T* item) {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (queue.empty()) {
+      return false;
+    }
+    *item = queue.front();
+    queue.pop();
+    return true;
+  }
+
+  bool empty() {
+    std::lock_guard<std::mutex> lock(mutex);
+    return queue.empty();
+  }
+};

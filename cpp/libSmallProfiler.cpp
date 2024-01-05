@@ -7,7 +7,7 @@ size_t interval_ns = 1000000;  // 1ms
 #include "other.hpp"
 #include "flamegraph.hpp"
 #include <profile.h>
-
+#include <iomanip>
 // our stuff
 
 
@@ -15,74 +15,152 @@ size_t interval_ns = 1000000;  // 1ms
 
 std::atomic<size_t> failedTraces = 0;
 std::atomic<size_t> totalTraces = 0;
+std::atomic<size_t> get_top_frame_in_signal_handler_failed = 0;
 
-std::atomic<int> available_trace;
-std::atomic<int> stored_traces;
+std::atomic<size_t> stored_in_queue;
+
+std::atomic<size_t> tried_at_safepoint = 0;
+std::atomic<size_t> compute_top_frame_failed = 0;
+std::atomic<size_t> walk_stack_failed = 0;
 
 const int MAX_DEPTH = 512; // max number of frames to capture
 
-struct Trace {
-  jmethodID* frames;
-  int num_frames;
+const int QUEUE_SIZE = 1024 * 10; // max size of safepoint queues
+
+
+// a lockless bounded queue with a fixed size, elements are of type ASGST_Frame
+// size is set in the constructor and cannot be changed
+class FrameQueue {
+
+  std::vector<ASGST_Frame> buffer;
+  std::atomic<size_t> head;
+  std::atomic<size_t> tail;
+  std::atomic<size_t> failedTraces = 0;
+
+public:
+  FrameQueue(size_t size) : head(0), tail(0) {
+    buffer.resize(size);
+  }
+
+  size_t size() const {
+    return head.load(std::memory_order_acquire) - tail.load(std::memory_order_relaxed);
+  }
+
+  bool push(ASGST_Frame frame) {
+    size_t h = head.load(std::memory_order_relaxed);
+    size_t t = tail.load(std::memory_order_acquire);
+    if (h - t == buffer.size()) {
+      return false;
+    }
+    buffer[h % buffer.size()] = frame;
+    head.store(h + 1, std::memory_order_release);
+    return true;
+  }
+
+  bool pop(ASGST_Frame *frame) {
+    size_t h = head.load(std::memory_order_acquire);
+    size_t t = tail.load(std::memory_order_relaxed);
+    if (h == t) {
+      return false;
+    }
+    *frame = buffer[t % buffer.size()];
+    tail.store(t + 1, std::memory_order_release);
+    return true;
+  }
+
+  size_t failed() {
+    return failedTraces.load();
+  }
+
+  void incFailed() {
+    failedTraces++;
+  }
+
+  void clear() {
+    head.store(0, std::memory_order_release);
+    tail.store(0, std::memory_order_release);
+    failedTraces.store(0, std::memory_order_release);
+  }
 };
 
-static jmethodID global_frames[MAX_DEPTH * MAX_THREADS_PER_ITERATION];
-static Trace global_traces[MAX_THREADS_PER_ITERATION];
 
-static int storeFrame(ASGST_FrameInfo *frame, Trace *trace) {
-  if (trace->num_frames < MAX_DEPTH) {
-    trace->frames[trace->num_frames++] = frame->method;
+static int storeFrame(ASGST_FrameInfo *frame, std::vector<jmethodID> *frames) {
+  if (frames->size() < MAX_DEPTH) {
+    frames->push_back(frame->method);
     return 1;
   }
   return 0;
 }
 
+Node node{"main"};
 
-static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
-  Trace *trace = &global_traces[available_trace++];
-  ASGST_Frame top_frame = ASGST_GetFrame(ucontext, true);
+
+
+SynchronizedQueue<std::vector<jmethodID>> tracesToAddQueue;
+
+void walkStackAtSafepoint(ASGST_Frame frame) {
+  tried_at_safepoint++;
+  std::vector<jmethodID> frames;
+  auto top_frame = ASGST_ComputeTopFrameAtSafepoint(frame);
   if (top_frame.pc == nullptr) {
-    stored_traces++;
-    trace->num_frames = 0;
+    failedTraces++;
+    compute_top_frame_failed++;
     return;
   }
-  trace->num_frames = 0;
-  int ret = ASGST_WalkStackFromFrame(top_frame, (ASGST_WalkStackCallback)storeFrame, nullptr, (void*)trace, 0);
+  int ret = ASGST_WalkStackFromFrame(top_frame, (ASGST_WalkStackCallback)storeFrame, nullptr, &frames, ASGST_RECONSTITUTE);
   if (ret <= 0) {
-    trace->num_frames = ret;
+    walk_stack_failed++;
+    failedTraces++;
+    return;
   }
-  stored_traces++;
+  tracesToAddQueue.push(frames);
+}
+
+
+void handleSafepoint(FrameQueue *queue) {
+  failedTraces += queue->failed();
+  totalTraces += queue->size() + queue->failed();
+  while (queue->size() > 0) {
+    ASGST_Frame frame;
+    if (queue->pop(&frame)) {
+      walkStackAtSafepoint(frame);
+    } else {
+      break;
+    }
+  }
+  queue->clear();
+}
+
+thread_local FrameQueue queue{QUEUE_SIZE};
+
+// setup the safepoint callback for the current thread
+void setupSafepointCallback() {
+  ASGST_SetSafepointCallback((ASGST_SafepointCallback)handleSafepoint, (void*)&queue);
+}
+
+
+static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
+  ASGST_Frame top_frame = ASGST_GetFrame(ucontext, true);
+  if (top_frame.pc == nullptr) {
+    queue.incFailed();
+    get_top_frame_in_signal_handler_failed++;
+    stored_in_queue++;
+    return;
+  }
+  if (!queue.push(top_frame)) {
+    queue.incFailed();
+    printf("queue full, size %ld\n", queue.size());
+  }
+  ASGST_TriggerSafePoint();
+  stored_in_queue++;
 }
 
 static void initSampler() {
-  for (int i = 0; i < MAX_THREADS_PER_ITERATION; i++) {
-    global_traces[i].frames = global_frames + i * MAX_DEPTH;
-    global_traces[i].num_frames = 0;
-  }
   installSignalHandler(SIGPROF, signalHandler);
 }
 
-Node node{"main"};
-
-static void processTraces(size_t num_threads) {
-  for (int i = 0; i < num_threads; i++) {
-    auto& trace = global_traces[i];
-    if (trace.num_frames <= 0) {
-      failedTraces++;
-    } else {
-      /*std::cout << "Trace:\n";
-      for (auto s : traceToStrings(trace.frames, trace.num_frames)) {
-        std::cout << " " << s << std::endl;
-      }*/
-      node.addTrace(traceToStrings(trace.frames, trace.num_frames));
-    }
-    totalTraces++;
-  }
-}
-
 static void sampleThreads() {
-  available_trace = 0;
-  stored_traces = 0;
+  stored_in_queue = 0;
 
   auto threads = thread_map.get_shuffled_threads();
   int count = 0;
@@ -93,20 +171,34 @@ static void sampleThreads() {
       count++;
     }
   }
-  while (stored_traces < count);
-  processTraces(threads.size());
+  while (stored_in_queue < count);
 }
 
 static void endSampler() {
-  printf("Failed traces: %10zu\n", failedTraces.load());
-  printf("Total traces:  %10zu\n", totalTraces.load());
-  printf("Failed ratio:  %10.2f%%\n", (double)failedTraces.load() / totalTraces.load() * 100);
+  std::cout << std::left << std::setw(30) << "Failed traces:" << std::setw(10) << failedTraces.load() << std::endl;
+  std::cout << std::left << std::setw(30) << "Total traces:" << std::setw(10) << totalTraces.load() << std::endl;
+  std::cout << std::left << std::setw(30) << "Failed ratio:" << std::setw(10) << std::fixed << std::setprecision(2)
+            << (double)failedTraces.load() / totalTraces.load() * 100 << "%" << std::endl;
+  std::cout << std::left << std::setw(30) << "Top frame in signal handler failed:" << std::setw(10)
+            << get_top_frame_in_signal_handler_failed.load() << std::endl;
+  std::cout << std::left << std::setw(30) << "Tried at safepoint:" << std::setw(10) << tried_at_safepoint.load() << std::endl;
+  std::cout << std::left << std::setw(30) << "Compute top frame failed:" << std::setw(10) << compute_top_frame_failed.load() << std::endl;
+  std::cout << std::left << std::setw(30) << "Walk stack failed:" << std::setw(10) << walk_stack_failed.load() << std::endl;
   std::ofstream flames("flames.html");
   node.writeAsHTML(flames, 100);
 }
 
 std::atomic<bool> shouldStop = false;
 std::thread samplerThread;
+
+void processTraceQueue() {
+  while (!shouldStop && !tracesToAddQueue.empty()) {
+    std::vector<jmethodID> trace;
+    if (tracesToAddQueue.pop(&trace)) {
+      node.addTrace(traceToStrings(trace.data(), trace.size()));
+    }
+  }
+}
 
 static void sampleLoop() {
   jvm->AttachCurrentThreadAsDaemon((void**)&env, nullptr);
@@ -120,6 +212,7 @@ static void sampleLoop() {
     if (std::chrono::seconds::zero() < sleep) {
       std::this_thread::sleep_for(sleep);
     }
+    processTraceQueue();
   }
   endSampler();
 }
@@ -145,6 +238,7 @@ OnThreadStart(jvmtiEnv *jvmti_env,
   ensureSuccess(jvmti->GetThreadInfo(thread, &info), "GetThreadInfo");
   thread_map.add(get_thread_id(), info.name, thread);
   pthread_sigmask(SIG_UNBLOCK, &prof_signal_mask, NULL);
+  setupSafepointCallback();
 }
 
 void JNICALL
@@ -211,6 +305,7 @@ jint Agent_Initialize(JavaVM *_jvm, char *options, void *reserved) {
   ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_LOAD, NULL), "ClassLoad");
   ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_PREPARE, NULL), "ClassPrepare");
   ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_VM_INIT, NULL), "VMInit");
+  ensureSuccess(jvmti->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_THREAD_START, NULL), "ThreadStart");
   return JNI_OK;
 }
 
