@@ -6,6 +6,7 @@ size_t interval_ns = 1000000;  // 1ms
 
 #include "other.hpp"
 #include "flamegraph.hpp"
+#include <profile.h>
 
 // our stuff
 
@@ -15,16 +16,41 @@ size_t interval_ns = 1000000;  // 1ms
 std::atomic<size_t> failedTraces = 0;
 std::atomic<size_t> totalTraces = 0;
 
-int available_trace;
-int stored_traces;
+std::atomic<int> available_trace;
+std::atomic<int> stored_traces;
 
 const int MAX_DEPTH = 512; // max number of frames to capture
 
-static ASGCT_CallFrame global_frames[MAX_DEPTH * MAX_THREADS_PER_ITERATION];
-static ASGCT_CallTrace global_traces[MAX_THREADS_PER_ITERATION];
+struct Trace {
+  jmethodID* frames;
+  int num_frames;
+};
+
+static jmethodID global_frames[MAX_DEPTH * MAX_THREADS_PER_ITERATION];
+static Trace global_traces[MAX_THREADS_PER_ITERATION];
+
+static int storeFrame(ASGST_FrameInfo *frame, Trace *trace) {
+  if (trace->num_frames < MAX_DEPTH) {
+    trace->frames[trace->num_frames++] = frame->method;
+    return 1;
+  }
+  return 0;
+}
+
 
 static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
-  asgct(&global_traces[available_trace++], MAX_DEPTH, ucontext);
+  Trace *trace = &global_traces[available_trace++];
+  ASGST_Frame top_frame = ASGST_GetFrame(ucontext, true);
+  if (top_frame.pc == nullptr) {
+    stored_traces++;
+    trace->num_frames = 0;
+    return;
+  }
+  trace->num_frames = 0;
+  int ret = ASGST_WalkStackFromFrame(top_frame, (ASGST_WalkStackCallback)storeFrame, nullptr, (void*)trace, 0);
+  if (ret <= 0) {
+    trace->num_frames = ret;
+  }
   stored_traces++;
 }
 
@@ -32,7 +58,6 @@ static void initSampler() {
   for (int i = 0; i < MAX_THREADS_PER_ITERATION; i++) {
     global_traces[i].frames = global_frames + i * MAX_DEPTH;
     global_traces[i].num_frames = 0;
-    global_traces[i].env_id = env;
   }
   installSignalHandler(SIGPROF, signalHandler);
 }
@@ -45,11 +70,11 @@ static void processTraces(size_t num_threads) {
     if (trace.num_frames <= 0) {
       failedTraces++;
     } else {
-      std::cout << "Trace:\n";
-      for (auto s : traceToStrings(trace)) {
+      /*std::cout << "Trace:\n";
+      for (auto s : traceToStrings(trace.frames, trace.num_frames)) {
         std::cout << " " << s << std::endl;
-      }
-      node.addTrace(traceToStrings(trace));
+      }*/
+      node.addTrace(traceToStrings(trace.frames, trace.num_frames));
     }
     totalTraces++;
   }
@@ -60,13 +85,15 @@ static void sampleThreads() {
   stored_traces = 0;
 
   auto threads = thread_map.get_shuffled_threads();
+  int count = 0;
   for (pid_t thread : threads) {
     auto info = thread_map.get_info(thread);
     if (info) {
       pthread_kill(info->pthread, SIGPROF);
+      count++;
     }
   }
-  while (stored_traces < threads.size());
+  while (stored_traces < count);
   processTraces(threads.size());
 }
 
@@ -156,7 +183,6 @@ extern "C" {
 
 static
 jint Agent_Initialize(JavaVM *_jvm, char *options, void *reserved) {
-  initASGCT();
   parseOptions(options);
   jvm = _jvm;
   jint res = jvm->GetEnv((void **) &jvmti, JVMTI_VERSION);

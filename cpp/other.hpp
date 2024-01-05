@@ -228,33 +228,10 @@ static SigAction installSignalHandler(int signo, SigAction action, SigHandler ha
     return oldsa.sa_sigaction;
 }
 
-typedef struct {
-  jint lineno;         // BCI in the source file, or < 0 for native methods
-  jmethodID method_id; // method executed in this frame
-} ASGCT_CallFrame;
-
-typedef struct {
-  JNIEnv *env_id;   // Env where trace was recorded
-  jint num_frames; // number of frames in this trace, < 0 gives us an error code
-  ASGCT_CallFrame *frames; // recorded frames
-} ASGCT_CallTrace;
-
-typedef void (*ASGCTType)(ASGCT_CallTrace *, jint, void *);
-
-ASGCTType asgct;
-
-static void initASGCT() {
-  asgct = reinterpret_cast<ASGCTType>(dlsym(RTLD_DEFAULT, "AsyncGetCallTrace"));
-  if (asgct == NULL) {
-    fprintf(stderr, "=== ASGCT not found ===\n");
-    exit(1);
-  }
-}
-
-std::vector<std::string> traceToStrings(ASGCT_CallTrace trace) {
+std::vector<std::string> traceToStrings(jmethodID* trace, int num_frames) {
   std::vector<std::string> ret;
-  for (int i = 0; i < trace.num_frames; i++) {
-    jmethodID method = trace.frames[i].method_id;
+  for (int i = 0; i < num_frames; i++) {
+    jmethodID method = trace[i];
     JvmtiDeallocator<char> name;
     JvmtiDeallocator<char> signature;
     if (jvmti->GetMethodName(method, name.addr(), signature.addr(), nullptr) != JVMTI_ERROR_NONE) {
