@@ -73,6 +73,7 @@ static void JNICALL OnClassPrepare(jvmtiEnv *jvmti, JNIEnv *jni_env,
 }
 
 std::atomic<size_t> asgctAndAsgstFailedTraces = 0;
+std::atomic<size_t> asgctNotWalkableNotJavaOrUnknownTraces = 0;
 std::atomic<size_t> failedTraces = 0;
 std::atomic<size_t> totalTraces = 0;
 std::atomic<size_t> successfullyHandlesTraces = 0;
@@ -293,6 +294,8 @@ static void signalHandler(int signo, siginfo_t* siginfo, void* ucontext) {
         int ret = ASGST_GetEnqueuableElement(ucontext, &elem);
         failedTraces++;
         printf("  asgst error %d\n", ret);
+      } else if (trace.num_frames == -4 || trace.num_frames == -5) {
+        asgctNotWalkableNotJavaOrUnknownTraces++;
       }
       return;
     }
@@ -328,6 +331,7 @@ static void sampleThreads() {
 static void endSampler() {
   size_t total_traces = totalTraces.load();
   size_t asgct_and_asgst_failed_traces = asgctAndAsgstFailedTraces.load();
+  size_t asgct_not_walkable_not_java_or_unknown_traces = asgctNotWalkableNotJavaOrUnknownTraces.load();
   size_t failed_traces = failedTraces.load();
   size_t stored_traces = successfullyHandlesTraces.load();
   size_t queue_full_count = queueFullCount.load();
@@ -351,6 +355,7 @@ static void endSampler() {
   printf("--------------------------------------------------------------\n");
   printf("| %-45s | %10zu |\n", "Total traces", total_traces);
   printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT and ASGST failed traces", asgct_and_asgst_failed_traces, (double)asgct_and_asgst_failed_traces / total_traces * 100);
+  printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT not walkable / unknown Java", asgct_not_walkable_not_java_or_unknown_traces, (double)asgct_not_walkable_not_java_or_unknown_traces / total_traces * 100);
   printf("| %-45s | %10zu | %2.2f%% |\n", "ASGST unsafe state", asgst_unsafe_state, (double)asgst_unsafe_state / total_traces * 100);
   printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT/ASGST method mismatch", asgct_asgst_method_mismatch, (double)asgct_asgst_method_mismatch / total_traces * 100);
   printf("| %-45s | %10zu | %2.2f%% |\n", "ASGCT/ASGST bci mismatch", asgct_asgst_bci_mismatch, (double)asgct_asgst_bci_mismatch / total_traces * 100);
