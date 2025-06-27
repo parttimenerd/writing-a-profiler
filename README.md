@@ -1,7 +1,7 @@
 Writing a Profiler from Scratch
 ===============================
 
-This repository belongs to my blog post [AsyncGetCallTrace Reworked: Frame by Frame with an Iterative Touch!](https://mostlynerdless.de/blog/2023/08/05/asyncgetcalltrace-reworked-frame-by-frame-with-an-iterative-touch). The profiler requires [a modified OpenJDK](https://github.com/parttimenerd/jdk/tree/asgst_iterator).
+This repository belongs to my blog post [AsyncGetCallTrace Reworked: Frame by Frame with an Iterative Touch!](https://mostlynerdless.de/blog/2023/08/07/asyncgetcalltrace-reworked-frame-by-frame-with-an-iterative-touch/). The profiler requires [a modified OpenJDK](https://github.com/parttimenerd/jdk/tree/asgst_iterator).
 
 How to run this all?
 --------------------
