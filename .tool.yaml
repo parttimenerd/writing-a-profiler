@@ -1,0 +1,37 @@
+tag: demo
+no_release: true
+tagline: Companion code for the "Writing a Profiler from Scratch" blog series. A minimal C++/JVMTI
+  sampling profiler that uses AsyncGetCallTrace via signal-based interrupts — showing the core
+  mechanics of how production profilers like async-profiler work under the hood.
+tagline_short: Companion code for "Writing a Profiler from Scratch" — minimal JVMTI/AsyncGetCallTrace profiler.
+links:
+- label: Blog series ↗
+  url: https://mostlynerdless.de/blog/2022/12/20/writing-a-profiler-from-scratch-introduction/
+when_to_use:
+- You are reading the blog series and want to run the example code
+- You want to study the core mechanics of a signal-based JVMTI sampling profiler
+when_not_to_use:
+- You need a production profiler — use async-profiler or JFR instead
+- You want a pure-Java profiler — see tiny-profiler instead
+install:
+- label: Build from source
+  lang: bash
+  code: |
+    git clone https://github.com/parttimenerd/writing-a-profiler
+    cd writing-a-profiler
+    javac samples/BasicSample.java
+    # macOS:
+    g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/darwin -I$JAVA_HOME/include \
+        -o cpp/libSmallProfiler.dylib -std=c++17 -shared -pthread
+    # Linux:
+    g++ cpp/libSmallProfiler.cpp -I$JAVA_HOME/include/linux -I$JAVA_HOME/include \
+        -o cpp/libSmallProfiler.so -std=c++17 -shared -pthread
+usage:
+- label: Profile a sample app
+  lang: bash
+  code: |
+    # macOS:
+    java -agentpath:cpp/libSmallProfiler.dylib=interval=0.001s -cp samples BasicSample
+    # Linux:
+    java -agentpath:cpp/libSmallProfiler.so=interval=0.001s -cp samples BasicSample
+note: Don't set the interval too low or you will crash the JVM. Educational code only — not for production use.
